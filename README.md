@@ -1,11 +1,11 @@
-# Bit Form Email Resender (0.2.0)
+# Bit Form Email Resender (0.2.1)
 
 An independent WordPress companion plugin for **Bit Form Free 3.4.0**, with optional **Bit Form Pro 3.4.0**. No modifications to either Bit Form plugin are required. This package does not contain any Bit Form proprietary plugin code.
 
 ## Install
 
 1. **Back up** the website and test on a staging site first. Keep your existing Bit Form Free and Pro plugins installed and active.
-2. In WordPress, open **Plugins → Add New Plugin → Upload Plugin**, choose `bit-form-email-resender-0.2.0.zip`, then install and activate it.
+2. In WordPress, open **Plugins → Add New Plugin → Upload Plugin**, choose `bit-form-email-resender-0.2.1.zip`, then install and activate it.
 3. Open **Bit Form → Resend Emails** (requires WordPress administrator `manage_options` capability).
 4. Select the form, locate an entry, and choose **Resend email**. Or select entries and click **Resend selected**.
 5. Choose **Review & resend** on one response or select responses and choose **Review & resend selected**.
@@ -62,6 +62,15 @@ Deactivate and delete the plugin in WordPress. Existing Bit Form entries and tem
 
 ## Upgrading from 0.1.0
 
-On WordPress Plugins, upload `bit-form-email-resender-0.2.0.zip` and choose **Replace current with uploaded** if prompted. If replacing is not offered, deactivate/delete only the companion **Bit Form Email Resender** plugin and then install 0.2.0; do not uninstall Bit Form Free or Pro. Existing Bit Form entries are never altered.
+On WordPress Plugins, upload `bit-form-email-resender-0.2.1.zip` and choose **Replace current with uploaded** if prompted. If replacing is not offered, deactivate/delete only the companion **Bit Form Email Resender** plugin and then install 0.2.1; do not uninstall Bit Form Free or Pro. Existing Bit Form entries are never altered.
 
 If the resend does not work, copy the precise error displayed after **Review & resend** or **Confirm & send**. Check browser Developer Tools → Network → `admin-ajax.php` and the WordPress/PHP error logs for a 400/403/409/500 response; a staging test is strongly recommended.
+
+## Version 0.2.1 troubleshooting
+
+- Adds an admin-only **Send mail transport test** button. This explicitly calls `wp_mail()` with a recipient supplied by the administrator and a plain test body. It checks Post SMTP separately from Bit Form's notification logic. Sending is limited to one test every 30 seconds per admin account.
+- More robust admin script loading based on the actual page slug / generated hook; addresses the case where the buttons appeared but nothing happened because the admin script was never loaded.
+- The admin page clarifies that **Review & resend** previews recipients; the actual send happens after **Confirm & send emails**.
+- Submission resends explicitly report a missing resolved `To` address and distinguish Bit Form failing to call `wp_mail()` from mail transport handoff failures. Custom recipients may be used when the original template's To value is empty.
+- If a test email appears in Post SMTP's logs but a resend does not, inspect the on-page resend status and Bit Form workflow and email template routing. Do not repeatedly retry uncertain sends; verify provider logs first to avoid duplicates.
+- No claim of live WordPress/Post SMTP testing: tested by PHP lint, JavaScript parse, and static source inspection only.

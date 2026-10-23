@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bit Form Email Resender
  * Description: Safely resend configured Bit Form email notifications for stored submissions. Email-only; no submission or integration replay.
- * Version: 0.2.0
+ * Version: 0.2.1
  * Requires PHP: 8.0
  * Requires at least: 6.5
  * Author: Ihasan Iftekhar Labib
@@ -16,16 +16,18 @@ if (!defined('ABSPATH')) {
 }
 
 final class BF_Email_Resender {
-    const VERSION = '0.2.0';
+    const VERSION = '0.2.1';
     const HISTORY_OPTION = 'bf_email_resender_history_v1';
     const MAX_BATCH = 5;
     const PAGE_SLUG = 'bf-email-resender';
+    private static $page_hook = ''; 
 
     public static function init(): void {
         add_action('admin_menu', [__CLASS__, 'register_menu'], 30);
         add_action('admin_enqueue_scripts', [__CLASS__, 'enqueue']);
         add_action('wp_ajax_bf_email_resender_send', [__CLASS__, 'ajax_send']);
         add_action('wp_ajax_bf_email_resender_preview', [__CLASS__, 'ajax_preview']);
+        add_action('wp_ajax_bf_email_resender_test_mail', [__CLASS__, 'ajax_test_mail']);
         add_action('admin_notices', [__CLASS__, 'version_notice']);
     }
 
@@ -52,7 +54,7 @@ final class BF_Email_Resender {
     }
 
     public static function register_menu(): void {
-        add_submenu_page(
+        self::$page_hook = add_submenu_page(
             'bitform',
             'Resend Bit Form Emails',
             'Resend Emails',
@@ -63,7 +65,10 @@ final class BF_Email_Resender {
     }
 
     public static function enqueue(string $hook): void {
-        if ('bitform_page_' . self::PAGE_SLUG !== $hook) {
+        // The WordPress page hook can differ when Bit Form builds its submenu dynamically.
+        // Match the actual registered hook and the page slug, rather than one hard-coded hook.
+        $page = isset($_GET['page']) ? sanitize_key(wp_unslash($_GET['page'])) : '';
+        if ($hook !== self::$page_hook && $page !== self::PAGE_SLUG) {
             return;
         }
         $base = plugin_dir_url(__FILE__);
@@ -114,6 +119,15 @@ final class BF_Email_Resender {
           <h1>Bit Form · Resend Emails</h1>
           <p>Regenerate notifications using <strong>current enabled templates</strong> and the saved submission data. This does not resubmit the form or trigger other integrations.</p>
           <div class="notice notice-info inline"><p><strong>Important:</strong> Current notification settings and current workflow conditions are used. This is not a byte-for-byte replay of the original message. SMTP acceptance does not guarantee inbox delivery.</p></div>
+          <section class="bfres-diagnostics" aria-label="Email transport diagnostic">
+            <h2>Step 1: Test WordPress / Post SMTP delivery</h2>
+            <p>Send one plain test message through <code>wp_mail()</code> to check that your mail transport works independently of Bit Form notifications. This sends an actual email and should appear in Post SMTP → Email Log.</p>
+            <label for="bfres-test-address">Test recipient</label>
+            <input type="email" id="bfres-test-address" placeholder="you@example.com" autocomplete="email" />
+            <button type="button" id="bfres-test-mail" class="button">Send mail transport test</button>
+            <p id="bfres-test-result" role="status" aria-live="polite"></p>
+          </section>
+          <p class="description">Step 2: Review a submission and click <strong>Confirm &amp; send emails</strong>. A successful recipient preview does not send any email.</p>
           <form method="get" class="bfres-filters">
             <input type="hidden" name="page" value="<?php echo esc_attr(self::PAGE_SLUG); ?>">
             <label for="bfres-form">Form</label>
@@ -507,6 +521,43 @@ final class BF_Email_Resender {
         wp_send_json_success(['entries' => $result]);
     }
 
+    /** Independent mail-path test: diagnoses Post SMTP separately from Bit Form templates/workflows. */
+    public static function ajax_test_mail(): void {
+        if (!self::allowed() || !check_ajax_referer('bf_email_resender_send', 'nonce', false)) {
+            wp_send_json_error(['message' => 'Permission or security token check failed. Reload the page.'], 403);
+        }
+        $raw = wp_unslash($_POST['address'] ?? '');
+        $address = is_string($raw) ? trim($raw) : '';
+        if (!is_email($address) || strlen($address) > 254) {
+            wp_send_json_error(['message' => 'Enter a valid recipient email address.'], 400);
+        }
+        $key = 'bfres_test_mail_' . get_current_user_id();
+        if (get_transient($key)) {
+            wp_send_json_error(['message' => 'Please allow at least 30 seconds between mail transport tests.'], 429);
+        }
+        set_transient($key, 1, 30);
+        $errors = [];
+        $failure = static function($error) use (&$errors) {
+            if (is_wp_error($error)) { $errors[] = $error->get_error_message(); }
+        };
+        add_action('wp_mail_failed', $failure, PHP_INT_MAX);
+        try {
+            $accepted = wp_mail(
+                sanitize_email($address),
+                'Bit Form Email Resender mail transport test',
+                'This is a requested test message from your WordPress administration. It does not use Bit Form templates or resend a submission.'
+            );
+        } catch (\Throwable $e) {
+            remove_action('wp_mail_failed', $failure, PHP_INT_MAX);
+            wp_send_json_error(['message' => 'wp_mail() threw an error: ' . $e->getMessage()], 500);
+        }
+        remove_action('wp_mail_failed', $failure, PHP_INT_MAX);
+        if (!$accepted) {
+            wp_send_json_error(['message' => 'wp_mail() returned false. ' . ($errors ? implode(' | ', $errors) : 'Check Post SMTP → Email Log / Session Transcript for the delivery error.')], 502);
+        }
+        wp_send_json_success(['message' => 'wp_mail() returned success. Check Post SMTP → Email Log and the test recipient inbox. This means the mailer accepted the message, not guaranteed inbox delivery.']);
+    }
+
     public static function ajax_send(): void {
         if (!self::allowed()) {
             wp_send_json_error(['message' => 'Insufficient permissions.'], 403);
@@ -610,6 +661,16 @@ final class BF_Email_Resender {
             $log_ok = $wpdb->insert($wpdb->prefix . 'bitforms_form_entry_log', $log_data);
             $log_id = $log_ok ? (int) $wpdb->insert_id : 0;
             foreach ($found as $item) {
+                // A template without a resolved To cannot send in original mode. Make this
+                // explicit instead of silently entering MailNotifier with an empty array.
+                if ($recipient_override === null) {
+                    $destinations = self::preview_notification_recipients($item, $formatted, $form_id);
+                    if (!$destinations['to']) {
+                        $errors[] = ($item['template']->title ?: ('Template #' . $item['template']->id))
+                            . ': No To recipient could be resolved. Review the original To field, form values and conditional routing, or choose custom To.';
+                        continue;
+                    }
+                }
                 $sent_in_this_call = 0;
                 $failed_in_this_call = false;
                 $captured_args = false;
@@ -662,7 +723,7 @@ final class BF_Email_Resender {
                 }
                 if (!$sent_in_this_call) {
                     $label = $item['template']->title ?: ('Template #' . $item['template']->id);
-                    $errors[] = $label . ': ' . ($seen_errors ? implode('; ', $seen_errors) : ($captured_args ? 'Mail handoff not confirmed.' : 'No email call occurred. Check recipients or notification settings.'));
+                    $errors[] = $label . ': ' . ($seen_errors ? implode('; ', $seen_errors) : ($captured_args ? 'Mail handoff not confirmed.' : 'Bit Form did not invoke wp_mail(). Check notification setup, saved entry field values and matching workflow rules.'));
                 }
             }
             $status = $accepted && !$errors ? 'accepted' : ($accepted ? 'partial' : 'error');

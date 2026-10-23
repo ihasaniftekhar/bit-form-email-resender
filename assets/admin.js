@@ -2,6 +2,9 @@
   'use strict';
   const table = document.getElementById('bfres-entries');
   if (!table || !window.bfEmailResender) return;
+  const testMailButton = document.getElementById('bfres-test-mail');
+  const testMailAddress = document.getElementById('bfres-test-address');
+  const testMailResult = document.getElementById('bfres-test-result');
   const all = document.getElementById('bfres-all');
   const progress = document.getElementById('bfres-progress');
   const bulk = document.getElementById('bfres-bulk');
@@ -49,6 +52,24 @@
     if (!response.ok || !body.success) throw new Error(body?.data?.message || ('Request failed (HTTP ' + response.status + ').'));
     return body.data;
   };
+  testMailButton?.addEventListener('click', async () => {
+    const address = testMailAddress.value.trim();
+    if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(address)) {
+      testMailResult.textContent = 'Enter a valid test email address.';
+      return;
+    }
+    if (!window.confirm('Send one real test message via Post SMTP / WordPress to ' + address + '?')) return;
+    testMailButton.disabled = true;
+    testMailResult.textContent = 'Testing wp_mail()…';
+    try {
+      const data = await request('bf_email_resender_test_mail', [], { address });
+      testMailResult.textContent = data.message || 'Mail transport test request completed.';
+    } catch (e) {
+      testMailResult.textContent = 'Mail transport test failed: ' + e.message;
+    } finally {
+      testMailButton.disabled = false;
+    }
+  });
   const mode = () => document.querySelector('input[name="bfres-recipient-mode"]:checked').value;
   document.querySelectorAll('input[name="bfres-recipient-mode"]').forEach(radio => {
     radio.addEventListener('change', () => { custom.hidden = mode() !== 'custom'; });
@@ -84,6 +105,9 @@
             count++;
             const sub = document.createElement('p');
             append(sub, 'strong', notice.template + ': ');
+            if (!(notice.to || []).length) {
+              append(sub, 'span', '⚠ Original To is empty: use custom recipient mode or fix notification routing. ');
+            }
             for (const field of ['to', 'cc', 'bcc']) {
               (notice[field] || []).forEach(address => allAddresses[field].add(address));
               const text = (notice[field] || []).join(', ') || '(none)';
