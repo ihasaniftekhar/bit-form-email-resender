@@ -93,6 +93,7 @@
       summary.replaceChildren();
       let count = 0;
       let errors = 0;
+      let attachmentProblems = 0;
       const allAddresses = { to: new Set(), cc: new Set(), bcc: new Set() };
       for (const entry of data.entries) {
         const section = document.createElement('div');
@@ -114,6 +115,23 @@
               append(sub, 'span', field.toUpperCase() + ' ' + text + ' · ');
             }
             section.appendChild(sub);
+            const assets = notice.attachments;
+            if (assets) {
+              const assetLine = document.createElement('p');
+              assetLine.className = 'bfres-asset-status';
+              append(assetLine, 'strong', 'Expected assets: ');
+              append(assetLine, 'span', `${assets.pdf_templates} PDF template(s); ${assets.uploads_available}/${assets.uploads_required} submission file(s); ${assets.media_available}/${assets.media_required} media file(s); ${assets.signatures_available}/${assets.signature_fields} stored signature(s) available.`);
+              section.appendChild(assetLine);
+              for (const msg of (assets.blocking || [])) {
+                const line = append(section, 'p', '⚠ Cannot send with missing configured attachments: ' + msg);
+                line.className = 'bfres-asset-error';
+                attachmentProblems++;
+              }
+              for (const msg of (assets.warnings || [])) {
+                const line = append(section, 'p', '⚠ ' + msg);
+                line.className = 'bfres-asset-warning';
+              }
+            }
           }
         }
         summary.appendChild(section);
@@ -128,7 +146,8 @@
       bcc.value = single ? [...allAddresses.bcc].join(', ') : '';
       document.querySelector('input[name="bfres-recipient-mode"][value="original"]').checked = true;
       custom.hidden = true;
-      reviewable = count > 0;
+      reviewable = count > 0 && attachmentProblems === 0;
+      if (attachmentProblems) progress.textContent = 'Attachments need attention: ' + attachmentProblems + ' blocking issue(s). Nothing has been sent. Fix the PDF / file settings before resending.';
       if (count === 0) progress.textContent = 'No matching email notifications to send. Review the selected form and notification template.';
     } catch (e) {
       summary.replaceChildren();

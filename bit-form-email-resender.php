@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bit Form Email Resender
  * Description: Safely resend configured Bit Form email notifications for stored submissions. Email-only; no submission or integration replay.
- * Version: 0.2.1
+ * Version: 0.3.0
  * Requires PHP: 8.0
  * Requires at least: 6.5
  * Author: Ihasan Iftekhar Labib
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 final class BF_Email_Resender {
-    const VERSION = '0.2.1';
+    const VERSION = '0.3.0';
     const HISTORY_OPTION = 'bf_email_resender_history_v1';
     const MAX_BATCH = 5;
     const PAGE_SLUG = 'bf-email-resender';
@@ -258,6 +258,24 @@ final class BF_Email_Resender {
         return $details;
     }
 
+    /** Workflow actions can override attachment / PDF selections from the template config.
+     *  Use the actual saved action details, just as Bit Form does during submission.
+     *  Keep explicit empty values (they mean disabled), and fill only ABSENT keys.
+     */
+    private static function details_from_action(object $template, $action_details): object {
+        $details = self::template_details($template);
+        if (is_object($action_details)) {
+            foreach (['to', 'from', 'from_name', 'cc', 'bcc', 'replyto', 'attachment', 'mediaAttachment', 'pdfId', 'pdfIds'] as $key) {
+                if (property_exists($action_details, $key)) {
+                    $details->$key = $action_details->$key;
+                }
+            }
+        }
+        // MailNotifier expects a JSON string id even if a workflow carries an object.
+        $details->id = wp_json_encode(['id' => (string) $template->id]);
+        return $details;
+    }
+
     /** Resolve currently eligible notification IDs without triggering submission side effects. */
     private static function resolve_notifications(int $form_id, int $entry_id, array $values, object $fields): array {
         $notifications = [];
@@ -270,7 +288,7 @@ final class BF_Email_Resender {
         foreach ($defaults as $notify) {
             $id = self::notification_id($notify->id ?? null);
             if (isset($template_map[$id])) {
-                $notifications[$id] = $id;
+                $notifications[$id] = self::details_from_action($template_map[$id], $notify);
             }
         }
         $workflow = new \BitApps\BitForm\Workflow\WorkFlow($form_id);
@@ -310,7 +328,7 @@ final class BF_Email_Resender {
                 $matched = self::condition_match($logics, $fields, $form_id, $condition, true);
                 $active = ($info->effect ?? 'show') === 'show' ? $matched : !$matched;
                 if ($active && isset($template_map[$id])) {
-                    $notifications[$id] = $id;
+                    $notifications[$id] = self::template_details($template_map[$id]);
                 } else {
                     unset($notifications[$id]);
                 }
@@ -319,7 +337,7 @@ final class BF_Email_Resender {
         $resolved = [];
         foreach (array_keys($notifications) as $id) {
             if (isset($template_map[$id])) {
-                $resolved[] = ['template' => $template_map[$id], 'details' => self::template_details($template_map[$id])];
+                $resolved[] = ['template' => $template_map[$id], 'details' => $notifications[$id]];
             }
         }
         return ['notifications' => $resolved, 'values' => $values];
@@ -393,7 +411,7 @@ final class BF_Email_Resender {
                     }
                     $id = self::notification_id($success->details->id ?? null);
                     if ($id && isset($template_map[$id])) {
-                        $notifications[$id] = $id;
+                        $notifications[$id] = self::details_from_action($template_map[$id], $success->details);
                     }
                 }
                 // Bit Form executes only the first matching branch of this workflow.
@@ -448,15 +466,143 @@ final class BF_Email_Resender {
             throw new \RuntimeException('Cannot load form fields.');
         }
         $fields = $content->fields;
+        $array_types = ['file-up', 'advanced-file-up', 'signature', 'repeater', 'check', 'image-select', 'select', 'name', 'address'];
         foreach ($fields as $key => $fld) {
             if (array_key_exists($key, $values)) {
+                // Bit Form saves array and object values as JSON in entrymeta.
+                // A new submission uses the PHP array; a resend must reconstruct it
+                // for the native file attachment, signature, and repeater processors.
+                if (in_array((string) ($fld->typ ?? ''), $array_types, true) && is_string($values[$key])) {
+                    $encoded = trim($values[$key]);
+                    if (str_starts_with($encoded, '[') || str_starts_with($encoded, '{')) {
+                        $decoded = json_decode($encoded, true);
+                        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                            $values[$key] = $decoded;
+                        }
+                    }
+                }
                 $fld->val = $values[$key];
                 $fld->name = $key;
             }
         }
         $resolved = self::resolve_notifications($form_id, $entry_id, $values, $fields);
         $formatted = \BitApps\BitForm\Helpers\FieldValueHandler::formatFieldValueForMail($fields, $resolved['values']);
-        return ['notifications' => $resolved['notifications'], 'formatted' => $formatted];
+        return ['notifications' => $resolved['notifications'], 'formatted' => $formatted, 'values' => $values, 'fields' => $fields];
+    }
+
+    /**
+     * Inspect the CURRENT attachment requirements before sending. No PDF is generated
+     * in preview. Only the native Bit Form mailer may generate PDFs for actual sends.
+     * Never return physical server paths or private signature filenames to the browser.
+     */
+    private static function attachment_check(array $item, int $form_id, int $entry_id, array $values, object $fields): array {
+        $details = $item['details'];
+        $report = [
+            'pdf_templates' => 0, 'signature_fields' => 0, 'signatures_available' => 0,
+            'uploads_required' => 0, 'uploads_available' => 0,
+            'media_required' => 0, 'media_available' => 0,
+            'warnings' => [], 'blocking' => [],
+        ];
+        $pdf_ids = [];
+        $raw_pdf_ids = !empty($details->pdfIds) && is_array($details->pdfIds)
+            ? $details->pdfIds : (!empty($details->pdfId) ? [$details->pdfId] : []);
+        foreach ($raw_pdf_ids as $encoded) {
+            if (is_string($encoded)) {
+                $decoded = json_decode($encoded);
+                $pdf_id = is_object($decoded) ? absint($decoded->id ?? 0) : 0;
+            } else {
+                $pdf_id = is_object($encoded) ? absint($encoded->id ?? 0) : 0;
+            }
+            if ($pdf_id) { $pdf_ids[$pdf_id] = $pdf_id; }
+            else { $report['blocking'][] = 'One configured PDF template has an invalid template ID.'; }
+        }
+        $report['pdf_templates'] = count($pdf_ids);
+        if ($pdf_ids) {
+            if (!defined('BITFORMPRO_VERSION') || !has_filter('bitform_generate_pdf_attachment')
+                || !class_exists('\BitApps\BitFormPro\Services\Messages\PdfTemplateHandler')) {
+                $report['blocking'][] = 'PDF attachments require active Bit Form Pro and its PDF generation hook.';
+            } else {
+                $handler = new \BitApps\BitFormPro\Services\Messages\PdfTemplateHandler($form_id);
+                foreach ($pdf_ids as $id) {
+                    try {
+                        $rows = $handler->getById($id);
+                        $row = is_array($rows) && !empty($rows) ? reset($rows) : null;
+                        if (is_wp_error($rows) || !$row) {
+                            $report['blocking'][] = 'PDF template #' . $id . ' cannot be loaded.';
+                        } elseif (!\BitApps\BitFormPro\Services\Messages\PdfTemplateHandler::isEnabled($row->pdf_config ?? null)) {
+                            $report['blocking'][] = 'PDF template #' . $id . ' is disabled.';
+                        }
+                    } catch (\Throwable $e) {
+                        $report['blocking'][] = 'PDF template #' . $id . ' cannot be verified: ' . $e->getMessage();
+                    }
+                }
+            }
+        }
+        $base = \BitApps\BitForm\Helpers\FileHandler::getEntriesFileUploadDir($form_id, $entry_id);
+        $real_base = realpath($base);
+        // WordPress media library attachments selected in the current template.
+        foreach ((array) ($details->mediaAttachment ?? []) as $attachment_id) {
+            $report['media_required']++;
+            $file = get_attached_file(absint($attachment_id));
+            if ($file && is_readable($file)) { $report['media_available']++; }
+            else { $report['blocking'][] = 'A selected WordPress media attachment is missing.'; }
+        }
+        // Selected uploaded/signature fields, including JSON-encoded multiple uploads.
+        foreach ((array) ($details->attachment ?? []) as $key) {
+            if (!is_string($key) || !array_key_exists($key, $values)) { continue; }
+            $files = self::file_names($values[$key]);
+            foreach ($files as $name) {
+                $report['uploads_required']++;
+                if (self::saved_upload_exists($real_base, $name)) { $report['uploads_available']++; }
+                else { $report['blocking'][] = 'A file selected for attachment in field ' . $key . ' is missing.'; }
+            }
+        }
+        // A form may contain signatures even when not set as separate mail attachments.
+        // Report them for email/PDF troubleshooting, without auto-attaching them to
+        // templates that never selected the signature field.
+        foreach ($fields as $key => $field) {
+            if ('signature' !== (string) ($field->typ ?? '')) { continue; }
+            foreach (self::file_names($values[$key] ?? null) as $name) {
+                if ('signature-failed.png' === $name) { continue; }
+                $report['signature_fields']++;
+                if (self::saved_upload_exists($real_base, $name)) {
+                    $report['signatures_available']++;
+                } else {
+                    $report['warnings'][] = 'A signature file saved with the entry is no longer readable.';
+                }
+            }
+        }
+        $report['blocking'] = array_values(array_unique($report['blocking']));
+        $report['warnings'] = array_values(array_unique($report['warnings']));
+        return $report;
+    }
+
+    private static function file_names($value): array {
+        if (is_string($value)) {
+            $trimmed = trim($value);
+            if (str_starts_with($trimmed, '[')) {
+                $decoded = json_decode($trimmed, true);
+                if (is_array($decoded)) { $value = $decoded; }
+            }
+        }
+        $result = [];
+        $visit = static function($item) use (&$visit, &$result) {
+            if (is_array($item)) {
+                foreach ($item as $part) { $visit($part); }
+            } elseif (is_string($item) && $item !== '') {
+                $result[] = trim($item);
+            }
+        };
+        $visit($value);
+        return array_values(array_unique(array_filter($result)));
+    }
+
+    private static function saved_upload_exists($real_base, string $name): bool {
+        if (!$real_base || !$name || str_contains($name, '\0')) { return false; }
+        $file = realpath($real_base . DIRECTORY_SEPARATOR . $name);
+        return $file !== false
+            && str_starts_with($file, $real_base . DIRECTORY_SEPARATOR)
+            && is_file($file) && is_readable($file);
     }
 
     /** Fully resolve notification routing as Bit Form would, for the current saved entry. */
@@ -511,7 +657,9 @@ final class BF_Email_Resender {
                 })) : $context['notifications'];
                 $notices = [];
                 foreach ($notifications as $item) {
-                    $notices[] = self::preview_notification_recipients($item, $context['formatted'], $form_id);
+                    $notice = self::preview_notification_recipients($item, $context['formatted'], $form_id);
+                    $notice['attachments'] = self::attachment_check($item, $form_id, $id, $context['values'], $context['fields']);
+                    $notices[] = $notice;
                 }
                 $result[] = ['entry_id' => $id, 'notifications' => $notices];
             } catch (\Throwable $e) {
@@ -660,7 +808,15 @@ final class BF_Email_Resender {
             ];
             $log_ok = $wpdb->insert($wpdb->prefix . 'bitforms_form_entry_log', $log_data);
             $log_id = $log_ok ? (int) $wpdb->insert_id : 0;
+            $all_attachments = 0;
+            $all_pdfs = 0;
             foreach ($found as $item) {
+                $report = self::attachment_check($item, $form_id, $entry_id, $context['values'], $context['fields']);
+                $label = $item['template']->title ?: ('Template #' . $item['template']->id);
+                if ($report['blocking']) {
+                    $errors[] = $label . ': Attachment preflight failed: ' . implode(' ', $report['blocking']);
+                    continue; // Never intentionally resend a message missing required assets.
+                }
                 // A template without a resolved To cannot send in original mode. Make this
                 // explicit instead of silently entering MailNotifier with an empty array.
                 if ($recipient_override === null) {
@@ -675,7 +831,9 @@ final class BF_Email_Resender {
                 $failed_in_this_call = false;
                 $captured_args = false;
                 $seen_errors = [];
-                $capture = static function($args) use (&$attempted, &$captured_args, &$addresses) {
+                $captured_attachments = [];
+                $capture = static function($args) use (&$attempted, &$captured_args, &$addresses, &$captured_attachments) {
+                    $captured_attachments = array_values(array_filter((array) ($args['attachments'] ?? []), 'is_string'));
                     $attempted++;
                     $captured_args = true;
                     foreach ((array) ($args['to'] ?? []) as $address) {
@@ -721,22 +879,33 @@ final class BF_Email_Resender {
                     remove_action('wp_mail_succeeded', $success, PHP_INT_MAX);
                     remove_action('wp_mail_failed', $failure, PHP_INT_MAX);
                 }
+                $pdf_count = 0;
+                foreach ($captured_attachments as $file) {
+                    if (strtolower(pathinfo($file, PATHINFO_EXTENSION)) === 'pdf') { $pdf_count++; }
+                }
+                $all_attachments += count($captured_attachments);
+                $all_pdfs += $pdf_count;
+                if ($sent_in_this_call && count($captured_attachments) < $report['uploads_required'] + $report['media_required'] + $report['pdf_templates']) {
+                    $errors[] = $label . ': Email handed off, but fewer attachments were passed to WordPress than configured. Review Post SMTP log before retrying.';
+                }
+                if ($sent_in_this_call && $pdf_count < $report['pdf_templates']) {
+                    $errors[] = $label . ': Email handed off without all configured PDF templates (' . $pdf_count . '/' . $report['pdf_templates'] . '). Check Bit Form Pro PDF errors before retrying.';
+                }
                 if (!$sent_in_this_call) {
-                    $label = $item['template']->title ?: ('Template #' . $item['template']->id);
                     $errors[] = $label . ': ' . ($seen_errors ? implode('; ', $seen_errors) : ($captured_args ? 'Mail handoff not confirmed.' : 'Bit Form did not invoke wp_mail(). Check notification setup, saved entry field values and matching workflow rules.'));
                 }
             }
             $status = $accepted && !$errors ? 'accepted' : ($accepted ? 'partial' : 'error');
-            $message = $accepted . ' notification(s) accepted by WordPress mail; ' . count($errors) . ' notification(s) not confirmed.';
+            $message = $accepted . ' notification(s) accepted by WordPress mail; ' . $all_attachments . ' attached file(s), including ' . $all_pdfs . ' PDF(s); ' . count($errors) . ' warning(s)/failure(s).';
             if ($errors) { $message .= ' ' . implode(' | ', $errors); }
             self::add_history([
                 'time' => current_time('mysql'), 'form' => $form_id, 'entry' => $entry_id,
-                'attempted' => $attempted, 'accepted' => $accepted, 'status' => $status,
+                'attempted' => $attempted, 'accepted' => $accepted, 'attachments' => $all_attachments, 'pdfs' => $all_pdfs, 'status' => $status,
                 'user' => (string) wp_get_current_user()->user_login,
                 'recipient_mode' => $recipient_override === null ? 'original' : 'custom',
                 'to' => array_values(array_unique($addresses)),
             ]);
-            return ['entry_id' => $entry_id, 'status' => $status, 'accepted' => $accepted, 'attempted' => $attempted, 'message' => $message];
+            return ['entry_id' => $entry_id, 'status' => $status, 'accepted' => $accepted, 'attempted' => $attempted, 'attachments' => $all_attachments, 'pdfs' => $all_pdfs, 'message' => $message];
         } finally {
             delete_option($lock);
         }

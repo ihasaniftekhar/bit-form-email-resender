@@ -20,3 +20,7 @@
 .bfres-preview-actions{display:flex;gap:10px;margin:18px 0 2px}
 .bfres-review-entry{border-top:1px solid #e5e7eb;padding:8px 0}
 .bfres-review-entry p{margin:6px 0 0;line-height:1.7;overflow-wrap:anywhere}
+
+.bfres-asset-status {color:#475569;font-size:13px}
+.bfres-asset-warning {color:#a35c00;font-weight:500}
+.bfres-asset-error {color:#a3301b;font-weight:600}
