@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bit Form Email Resender
  * Description: Safely resend configured Bit Form email notifications for stored submissions. Email-only; no submission or integration replay.
- * Version: 0.4.1
+ * Version: 0.4.2
  * Requires PHP: 8.0
  * Requires at least: 6.5
  * Author: Ihasan Iftekhar Labib
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 final class BF_Email_Resender {
-    const VERSION = '0.4.1';
+    const VERSION = '0.4.2';
     const HISTORY_OPTION = 'bf_email_resender_history_v1';
     const MAX_BATCH = 5;
     const PAGE_SLUG = 'bf-email-resender';
@@ -28,6 +28,7 @@ final class BF_Email_Resender {
         add_action('wp_ajax_bf_email_resender_send', [__CLASS__, 'ajax_send']);
         add_action('wp_ajax_bf_email_resender_preview', [__CLASS__, 'ajax_preview']);
         add_action('wp_ajax_bf_email_resender_test_mail', [__CLASS__, 'ajax_test_mail']);
+        add_action('wp_ajax_bf_email_resender_pdf_self_test', [__CLASS__, 'ajax_pdf_self_test']);
         add_action('admin_notices', [__CLASS__, 'version_notice']);
     }
 
@@ -126,6 +127,11 @@ final class BF_Email_Resender {
             <input type="email" id="bfres-test-address" placeholder="you@example.com" autocomplete="email" />
             <button type="button" id="bfres-test-mail" class="button">Send mail transport test</button>
             <p id="bfres-test-result" role="status" aria-live="polite"></p>
+            <hr />
+            <h3>PDF renderer diagnostics</h3>
+            <p>Run a blank, temporary PDF test through Bit Form Pro / mPDF. It does not use or email submission data. The generated test file is removed immediately.</p>
+            <button type="button" id="bfres-pdf-self-test" class="button">Test Bit Form Pro PDF generator</button>
+            <p id="bfres-pdf-test-result" role="status" aria-live="polite"></p>
           </section>
           <p class="description">Step 2: Review a submission and click <strong>Confirm &amp; send emails</strong>. A successful recipient preview does not send any email.</p>
           <form method="get" class="bfres-filters">
@@ -642,6 +648,101 @@ final class BF_Email_Resender {
      * at whether a template was disabled, missing, or failed in the mPDF renderer.
      * Never return the PDF HTML, submitted field values, local file paths or PHP traces.
      */
+    /** Return a bounded, admin-only error description without submitting PDF HTML or credentials. */
+    private static function safe_pdf_error(string $raw): string {
+        $raw = wp_strip_all_tags($raw);
+        // Image/font errors may contain signed URLs, absolute paths and submission addresses.
+        $raw = preg_replace('~https?://[^\s\"\'<>]+~i', '[URL]', $raw);
+        $raw = preg_replace('~(?:[a-zA-Z]:[\\\\/]|/(?:home|var|srv|mnt|tmp|wp-content|opt|usr)/)[^\s\"\'<>]+~i', '[path]', $raw);
+        $raw = preg_replace('/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i', '[email]', $raw);
+        $raw = preg_replace('/[\x00-\x1F\x7F]+/', ' ', $raw);
+        return substr(trim((string) $raw), 0, 350);
+    }
+
+    /**
+     * A minimal real mPDF health check, run only on explicit administrator request.
+     * Uses Pro's installed PDF renderer and the same Bit Form output directory.
+     * No user records are read and temporary output is deleted.
+     */
+    public static function ajax_pdf_self_test(): void {
+        if (!self::allowed()) { wp_send_json_error(['message' => 'Insufficient permissions.'], 403); }
+        check_ajax_referer('bf_email_resender_send', 'nonce');
+        $missing = [];
+        foreach (['mbstring', 'gd'] as $ext) {
+            if (!extension_loaded($ext)) { $missing[] = $ext; }
+        }
+        $dependency_warning = $missing ? ' Missing PHP extension(s): ' . implode(', ', $missing) . '.' : '';
+        if (!class_exists('\\BitApps\\BitFormPro\\Services\\Admin\\AppSetting\\Pdf')) {
+            wp_send_json_success(['message' => 'Bit Form Pro PDF generator is not available.' . $dependency_warning, 'passed' => false]);
+        }
+        $dir_error = self::pdf_output_directory_status();
+        if ($dir_error) {
+            wp_send_json_success(['message' => $dir_error . $dependency_warning, 'passed' => false]);
+        }
+        $path = rtrim(BITFORMS_CONTENT_DIR, '/\\') . DIRECTORY_SEPARATOR . 'pdf';
+        $settings = (object) ['pdfFileName' => 'bfres-check-' . wp_generate_password(12, false, false)];
+        $output = null;
+        $message = '';
+        $passed = false;
+        try {
+            $output = \BitApps\BitFormPro\Services\Admin\AppSetting\Pdf::getInstance()->generator(
+                $settings, '<html><body><p>Bit Form PDF renderer health check</p></body></html>', $path, null, 'F'
+            );
+            if (is_wp_error($output)) {
+                $message = 'PDF generator failed: ' . self::safe_pdf_error($output->get_error_message());
+            } elseif (!is_string($output) || !is_file($output) || !is_readable($output) || filesize($output) < 100) {
+                $message = 'PDF generator returned no readable output file.';
+            } else {
+                $message = 'PASS: Bit Form Pro generated a minimal PDF. If submission PDFs still fail, check the template-specific diagnostic displayed with the resend result.';
+                $passed = true;
+            }
+        } catch (\Throwable $e) {
+            $message = 'PHP exception during minimal PDF render: ' . self::safe_pdf_error($e->getMessage());
+        } finally {
+            if (is_string($output) && is_file($output) && basename($output) === $settings->pdfFileName . '.pdf') {
+                @unlink($output);
+            }
+        }
+        wp_send_json_success(['message' => $message . $dependency_warning, 'passed' => $passed]);
+    }
+
+    /**
+     * When native Pro reports a generic PDF error, reproduce it once using the body
+     * and settings it passed to mPDF. We only expose the underlying exception summary.
+     * Diagnostic PDFs, if any, are deleted; this does not send a PDF-less email.
+     */
+    private static function pdf_template_render_diagnostics(array $traces): array {
+        if (!defined('BITFORMS_CONTENT_DIR') || !class_exists('\\BitApps\\BitFormPro\\Services\\Admin\\AppSetting\\Pdf')) { return []; }
+        $dir = rtrim(BITFORMS_CONTENT_DIR, '/\\') . DIRECTORY_SEPARATOR . 'pdf';
+        if (!is_dir($dir) || !is_writable($dir)) { return ['PDF output directory is not writable.']; }
+        $notes = [];
+        foreach (array_slice($traces, 0, 2) as $trace) {
+            if (empty($trace['setting']) || !is_object($trace['setting']) || !is_string($trace['body'])) { continue; }
+            $setting = clone $trace['setting'];
+            $setting->pdfFileName = 'bfres-debug-' . wp_generate_password(12, false, false);
+            $result = null;
+            try {
+                $result = \BitApps\BitFormPro\Services\Admin\AppSetting\Pdf::getInstance()->generator(
+                    $setting, $trace['body'], $dir, null, 'F'
+                );
+                if (is_wp_error($result)) {
+                    $notes[] = 'mPDF: ' . self::safe_pdf_error($result->get_error_message());
+                } elseif (!is_string($result) || !is_file($result)) {
+                    $notes[] = 'mPDF returned no output file during diagnostic reproduction.';
+                } else {
+                    $notes[] = 'Diagnostic render succeeded on retry; check file name/output path, transient resources and any filter affecting PDF output.';
+                }
+            } catch (\Throwable $e) {
+                $notes[] = 'PHP error: ' . self::safe_pdf_error($e->getMessage());
+            } finally {
+                if (is_string($result) && is_file($result) && basename($result) === $setting->pdfFileName . '.pdf') {
+                    @unlink($result);
+                }
+            }
+        }
+        return array_values(array_unique($notes));
+    }
+
     private static function pdf_native_diagnostics(int $log_id): array {
         if (!$log_id) { return []; }
         global $wpdb;
@@ -974,8 +1075,13 @@ final class BF_Email_Resender {
                 $captured_attachments = [];
                 $pdf_generated = null;
                 $pdf_bodies_prepared = 0;
-                $pdf_body_observer = static function($body) use (&$pdf_bodies_prepared) {
+                $pdf_render_traces = [];
+                $pdf_body_observer = static function($body, $ctx = null) use (&$pdf_bodies_prepared, &$pdf_render_traces) {
                     $pdf_bodies_prepared++;
+                    if (is_string($body) && is_array($ctx) && isset($ctx['pdf_setting']) && is_object($ctx['pdf_setting']) && count($pdf_render_traces) < 2) {
+                        // The Pro renderer adds header/footer to this same object immediately after the hook.
+                        $pdf_render_traces[] = ['body' => $body, 'setting' => $ctx['pdf_setting']];
+                    }
                     return $body;
                 };
                 $pdf_observer = static function($paths) use (&$pdf_generated) {
@@ -1020,7 +1126,7 @@ final class BF_Email_Resender {
                         $seen_errors[] = $error->get_error_message();
                     }
                 };
-                add_filter('bitform_filter_pdf_body', $pdf_body_observer, PHP_INT_MAX, 1);
+                add_filter('bitform_filter_pdf_body', $pdf_body_observer, PHP_INT_MAX, 2);
                 add_filter('bitform_generate_pdf_attachment', $pdf_observer, PHP_INT_MAX, 1);
                 add_filter('pre_wp_mail', $pdf_guard, -PHP_INT_MAX, 2);
                 add_filter('wp_mail', $capture, PHP_INT_MAX);
@@ -1082,8 +1188,12 @@ final class BF_Email_Resender {
                     } elseif ($report['pdf_templates']) {
                         $debug_details .= ' No native PDF status record found for this resend.';
                     }
+                    if ($report['pdf_templates'] && $pdf_generated === 0 && $pdf_render_traces) {
+                        $render_diagnostics = self::pdf_template_render_diagnostics($pdf_render_traces);
+                        if ($render_diagnostics) { $debug_details .= ' Actual mPDF diagnostic: ' . implode(' | ', $render_diagnostics) . '.'; }
+                    }
                     $errors[] = $label . ': ' . $why . $pdf_details . $debug_details
-                        . ($report['pdf_templates'] ? ' If the renderer reached the templates, inspect Bit Form/PHP logs for the underlying mPDF exception.' : '');
+                        . ($report['pdf_templates'] ? ' If needed, use the PDF generator test above and check PHP error logs.' : '');
                 }
             }
             $status = $accepted && !$errors ? 'accepted' : ($accepted ? 'partial' : 'error');

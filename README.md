@@ -1,11 +1,11 @@
-# Bit Form Email Resender — 0.4.0
+# Bit Form Email Resender — 0.4.2
 
 Independent companion plugin for **Bit Form Free 3.4.0**, with optional **Bit Form Pro 3.4.0**. Reviewed against Bit Form 3.4.0 plugin source. No modifications to the underlying Bit Form plugins. Requires WordPress 6.5+ and PHP 8.0+.
 
 ## Install / upgrade
 
 1. Back up and, where possible, test on staging first.
-2. WordPress → Plugins → Add New Plugin → Upload Plugin → `bit-form-email-resender-0.4.0.zip`.
+2. WordPress → Plugins → Add New Plugin → Upload Plugin → `bit-form-email-resender-0.4.2.zip`.
 3. When upgrading from 0.2.1, select **Replace current with uploaded**. Leave Bit Form Free, Pro, and Post SMTP installed and active.
 4. Open **Bit Form → Resend Emails**, select a form and one response, then **Review & resend**.
 5. Review the original recipient list, **select the correct PDF templates if needed**, and inspect the **Expected assets** summary, which includes the number of configured Pro PDFs, submission attachments, media files, and saved signature images.
@@ -56,3 +56,10 @@ The activity history stores time, form ID, entry ID, current administrator usern
 ## v0.4.1 PDF diagnostics
 
 On a blocked resend, the result now displays the number of PDFs that reached the native HTML-generation stage and any native Bit Form per-PDF success/error messages for this resend. A failed check of the PDF output folder is reported before attempting email. No PDF contents, entry values, or paths are included in the admin AJAX output. This release does not bypass the fail-closed PDF attachment guard. If the PDF body reached generation but no attachment was produced, check the WordPress PHP error log with WP_DEBUG_LOG enabled for the native mPDF exception.
+
+
+## v0.4.2 — specific mPDF diagnostics
+
+* Added an administrator-only **Test Bit Form Pro PDF generator** control that creates and deletes a simple, temporary PDF using Pro's mPDF configuration. It never uses entry data, never emails the test file, and reports errors from the generator (including missing PHP extensions and directory failures).
+* When the native PDF renderer fails during resend and there was a prepared PDF body, the plugin performs a maximum of two isolated diagnostic reproductions with temporary filenames, capturing the underlying `WP_Error` or caught PHP error. Any successful diagnostic output is deleted. The form PDF HTML and recipient data are never displayed in the error output.
+* This is a diagnostic release; it does not bypass the PDF attachment safety check, replace Pro or Post SMTP, or guarantee compatibility with every PDF template. A failing minimal health check indicates environment-related problems; a passing health check with failing PDF templates suggests template-specific assets, fonts or PDF settings. If both are reported, include both messages when requesting assistance.

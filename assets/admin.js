@@ -71,6 +71,20 @@
       testMailButton.disabled = false;
     }
   });
+  const pdfTestButton = document.getElementById('bfres-pdf-self-test');
+  const pdfTestResult = document.getElementById('bfres-pdf-test-result');
+  pdfTestButton?.addEventListener('click', async () => {
+    pdfTestButton.disabled = true;
+    pdfTestResult.textContent = 'Rendering a temporary PDF using Bit Form Pro…';
+    try {
+      const data = await request('bf_email_resender_pdf_self_test', []);
+      pdfTestResult.textContent = data.message || 'PDF test completed.';
+    } catch (e) {
+      pdfTestResult.textContent = 'PDF test could not run: ' + e.message;
+    } finally {
+      pdfTestButton.disabled = false;
+    }
+  });
   const mode = () => document.querySelector('input[name="bfres-recipient-mode"]:checked').value;
   document.querySelectorAll('input[name="bfres-recipient-mode"]').forEach(radio => {
     radio.addEventListener('change', () => { custom.hidden = mode() !== 'custom'; });
