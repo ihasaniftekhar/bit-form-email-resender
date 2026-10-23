@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bit Form Email Resender
  * Description: Safely resend configured Bit Form email notifications for stored submissions. Email-only; no submission or integration replay.
- * Version: 0.4.0
+ * Version: 0.4.1
  * Requires PHP: 8.0
  * Requires at least: 6.5
  * Author: Ihasan Iftekhar Labib
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 final class BF_Email_Resender {
-    const VERSION = '0.4.0';
+    const VERSION = '0.4.1';
     const HISTORY_OPTION = 'bf_email_resender_history_v1';
     const MAX_BATCH = 5;
     const PAGE_SLUG = 'bf-email-resender';
@@ -575,6 +575,8 @@ final class BF_Email_Resender {
         $report['pdf_ids'] = $pdf_ids;
         $report['pdf_templates'] = count($pdf_ids);
         if ($pdf_ids) {
+            $dir_error = self::pdf_output_directory_status();
+            if ($dir_error !== '') { $report['blocking'][] = $dir_error; }
             if (!defined('BITFORMPRO_VERSION') || !has_filter('bitform_generate_pdf_attachment')
                 || !class_exists('\BitApps\BitFormPro\Services\Messages\PdfTemplateHandler')) {
                 $report['blocking'][] = 'PDF attachments require active Bit Form Pro and its PDF generation hook.';
@@ -632,6 +634,46 @@ final class BF_Email_Resender {
         $report['blocking'] = array_values(array_unique($report['blocking']));
         $report['warnings'] = array_values(array_unique($report['warnings']));
         return $report;
+    }
+
+    /**
+     * Expose Bit Form Pro's native, per-PDF diagnostic records for this RESEND log.
+     * Native Pro records messages in bitforms_form_log_details, which avoids guessing
+     * at whether a template was disabled, missing, or failed in the mPDF renderer.
+     * Never return the PDF HTML, submitted field values, local file paths or PHP traces.
+     */
+    private static function pdf_native_diagnostics(int $log_id): array {
+        if (!$log_id) { return []; }
+        global $wpdb;
+        $table = $wpdb->prefix . 'bitforms_form_log_details';
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT api_type, response_type, response_obj FROM `{$table}` WHERE log_id = %d ORDER BY id DESC LIMIT 30",
+            $log_id
+        ));
+        if (!is_array($rows)) { return []; }
+        $notes = [];
+        foreach ($rows as $row) {
+            $type = json_decode((string) ($row->api_type ?? ''), true);
+            if (!is_array($type) || ($type['type_name'] ?? null) !== 'pdf') { continue; }
+            $raw = json_decode((string) ($row->response_obj ?? ''), true);
+            if (is_string($raw)) { $message = $raw; }
+            elseif (is_array($raw)) { $message = (string) ($raw['description'] ?? $raw['message'] ?? 'PDF event logged'); }
+            else { $message = 'PDF event logged'; }
+            $message = trim(wp_strip_all_tags($message));
+            if ($message !== '') { $notes[] = sanitize_text_field((string) ($row->response_type ?? 'unknown')) . ': ' . substr($message, 0, 160); }
+        }
+        return array_values(array_unique($notes));
+    }
+
+    /** Check the single native Pro PDF output directory; do not expose its path. */
+    private static function pdf_output_directory_status(): string {
+        if (!defined('BITFORMS_CONTENT_DIR')) { return 'Bit Form PDF content directory is undefined.'; }
+        $root = BITFORMS_CONTENT_DIR;
+        if (!is_dir($root)) { return 'Bit Form content directory is missing.'; }
+        $pdf = rtrim($root, '/\\') . DIRECTORY_SEPARATOR . 'pdf';
+        if (!is_dir($pdf) && !wp_mkdir_p($pdf)) { return 'Cannot create Bit Form PDF output directory (filesystem permissions).'; }
+        if (!is_dir($pdf) || !is_writable($pdf)) { return 'Bit Form PDF output directory is not writable (filesystem permissions).'; }
+        return '';
     }
 
     private static function file_names($value): array {
@@ -931,6 +973,11 @@ final class BF_Email_Resender {
                 $seen_errors = [];
                 $captured_attachments = [];
                 $pdf_generated = null;
+                $pdf_bodies_prepared = 0;
+                $pdf_body_observer = static function($body) use (&$pdf_bodies_prepared) {
+                    $pdf_bodies_prepared++;
+                    return $body;
+                };
                 $pdf_observer = static function($paths) use (&$pdf_generated) {
                     $paths = is_array($paths) ? $paths : [$paths];
                     $pdf_generated = count(array_filter($paths, static function($path) {
@@ -973,6 +1020,7 @@ final class BF_Email_Resender {
                         $seen_errors[] = $error->get_error_message();
                     }
                 };
+                add_filter('bitform_filter_pdf_body', $pdf_body_observer, PHP_INT_MAX, 1);
                 add_filter('bitform_generate_pdf_attachment', $pdf_observer, PHP_INT_MAX, 1);
                 add_filter('pre_wp_mail', $pdf_guard, -PHP_INT_MAX, 2);
                 add_filter('wp_mail', $capture, PHP_INT_MAX);
@@ -997,6 +1045,7 @@ final class BF_Email_Resender {
                     $seen_errors[] = $e->getMessage();
                 } finally {
                     if (null !== $route_override) { remove_filter('bitform_email_conditional_routing', $route_override, PHP_INT_MAX); }
+                    remove_filter('bitform_filter_pdf_body', $pdf_body_observer, PHP_INT_MAX);
                     remove_filter('bitform_generate_pdf_attachment', $pdf_observer, PHP_INT_MAX);
                     remove_filter('pre_wp_mail', $pdf_guard, -PHP_INT_MAX);
                     remove_filter('wp_mail', $capture, PHP_INT_MAX);
@@ -1024,8 +1073,17 @@ final class BF_Email_Resender {
                     } else {
                         $why = $seen_errors ? implode('; ', $seen_errors) : ($captured_args ? 'Mail handoff not confirmed.' : 'Bit Form did not invoke wp_mail().');
                     }
-                    $errors[] = $label . ': ' . $why . $pdf_details
-                        . ($report['pdf_templates'] ? ' Check Bit Form Pro PDF generation and Bit Form debug/PHP logs.' : '');
+                    $native_diagnostics = $report['pdf_templates'] ? self::pdf_native_diagnostics($log_id) : [];
+                    $debug_details = $report['pdf_templates']
+                        ? ' PDF body preparation reached ' . $pdf_bodies_prepared . ' / ' . $report['pdf_templates'] . ' template(s).'
+                        : '';
+                    if ($native_diagnostics) {
+                        $debug_details .= ' Native Bit Form results: ' . implode(' | ', $native_diagnostics) . '.';
+                    } elseif ($report['pdf_templates']) {
+                        $debug_details .= ' No native PDF status record found for this resend.';
+                    }
+                    $errors[] = $label . ': ' . $why . $pdf_details . $debug_details
+                        . ($report['pdf_templates'] ? ' If the renderer reached the templates, inspect Bit Form/PHP logs for the underlying mPDF exception.' : '');
                 }
             }
             $status = $accepted && !$errors ? 'accepted' : ($accepted ? 'partial' : 'error');

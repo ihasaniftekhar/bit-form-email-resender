@@ -51,3 +51,8 @@ Independent companion plugin for **Bit Form Free 3.4.0**, with optional **Bit Fo
 PHP lint, JavaScript syntax validation, isolated PHP PDF-configuration tests and ZIP-integrity checks were performed. **A live WordPress + Bit Form Pro PDF render + Post SMTP delivery test was not available**, so test one known entry with a signature and PDF and inspect the received MIME attachments before bulk sending. WordPress reporting a successful mail handoff is not proof of inbox delivery.
 
 The activity history stores time, form ID, entry ID, current administrator username, recipient mode, To addresses seen at handoff and attachment/PDF counts; it does not store message bodies or the private physical file paths. Removing this companion plugin does not alter Bit Form entries. The bounded history option remains in the database after removal.
+
+
+## v0.4.1 PDF diagnostics
+
+On a blocked resend, the result now displays the number of PDFs that reached the native HTML-generation stage and any native Bit Form per-PDF success/error messages for this resend. A failed check of the PDF output folder is reported before attempting email. No PDF contents, entry values, or paths are included in the admin AJAX output. This release does not bypass the fail-closed PDF attachment guard. If the PDF body reached generation but no attachment was produced, check the WordPress PHP error log with WP_DEBUG_LOG enabled for the native mPDF exception.

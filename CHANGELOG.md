@@ -1,3 +1,9 @@
+## 0.4.1
+- Surface Bit Form Pro native PDF log outcomes per resend without exposing submission data or filesystem paths.
+- Show how many PDF templates reached the PDF body renderer.
+- Check Bit Form PDF output folder writability and fail closed if the server cannot create files.
+- Preserve original/custom recipients and existing PDF selection behavior.
+
 ## 0.4.0
 - Fix empty workflow PDF selections incorrectly overriding current email template PDFs.
 - Display each notification's selectable enabled Bit Form Pro PDF templates during resend review.
