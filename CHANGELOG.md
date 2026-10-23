@@ -1,3 +1,8 @@
+## 0.4.3
+- Add real on-disk status check and controlled repair for all four missing DejaVu Serif Condensed mPDF fonts.
+- Download on explicit admin click from official mPDF source into Bit Form uploads/fonts, with TrueType magic/size validation and filesystem/HTTP diagnostics.
+- Leave WordPress email transport and PDFs fail-closed handling unchanged.
+
 ## 0.4.2
 - Added a real mPDF health check using Bit Form Pro, with temp cleanup.
 - On failed PDF send, replayed up to two captured PDF bodies only for diagnostic WP_Error details and removed any diagnostic outputs.

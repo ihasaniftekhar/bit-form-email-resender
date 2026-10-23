@@ -1,11 +1,11 @@
-# Bit Form Email Resender — 0.4.2
+# Bit Form Email Resender — 0.4.3
 
 Independent companion plugin for **Bit Form Free 3.4.0**, with optional **Bit Form Pro 3.4.0**. Reviewed against Bit Form 3.4.0 plugin source. No modifications to the underlying Bit Form plugins. Requires WordPress 6.5+ and PHP 8.0+.
 
 ## Install / upgrade
 
 1. Back up and, where possible, test on staging first.
-2. WordPress → Plugins → Add New Plugin → Upload Plugin → `bit-form-email-resender-0.4.2.zip`.
+2. WordPress → Plugins → Add New Plugin → Upload Plugin → `bit-form-email-resender-0.4.3.zip`.
 3. When upgrading from 0.2.1, select **Replace current with uploaded**. Leave Bit Form Free, Pro, and Post SMTP installed and active.
 4. Open **Bit Form → Resend Emails**, select a form and one response, then **Review & resend**.
 5. Review the original recipient list, **select the correct PDF templates if needed**, and inspect the **Expected assets** summary, which includes the number of configured Pro PDFs, submission attachments, media files, and saved signature images.
@@ -63,3 +63,15 @@ On a blocked resend, the result now displays the number of PDFs that reached the
 * Added an administrator-only **Test Bit Form Pro PDF generator** control that creates and deletes a simple, temporary PDF using Pro's mPDF configuration. It never uses entry data, never emails the test file, and reports errors from the generator (including missing PHP extensions and directory failures).
 * When the native PDF renderer fails during resend and there was a prepared PDF body, the plugin performs a maximum of two isolated diagnostic reproductions with temporary filenames, capturing the underlying `WP_Error` or caught PHP error. Any successful diagnostic output is deleted. The form PDF HTML and recipient data are never displayed in the error output.
 * This is a diagnostic release; it does not bypass the PDF attachment safety check, replace Pro or Post SMTP, or guarantee compatibility with every PDF template. A failing minimal health check indicates environment-related problems; a passing health check with failing PDF templates suggests template-specific assets, fonts or PDF settings. If both are reported, include both messages when requesting assistance.
+
+## v0.4.3 — repair missing DejaVu Serif Condensed fonts
+
+This release addresses the confirmed mPDF exception `Cannot find TTF TrueType font file "DejaVuSerifCondensed.ttf"`. Bit Form Pro 3.4.0 ships only the four DejaVu Sans variants, while mPDF's built-in `dejavuserifcondensed` family expects four other TTF files. Changing a default font in Bit Form does not override every CSS font reference in a PDF template. Bit Form's downloaded-font setting is not a reliable indication that the font files are present.
+
+Under **Bit Form → Resend Emails → PDF renderer diagnostics**, use **Check DejaVu Serif Condensed font files** to inspect the four actual font files, or **Repair missing font files** to download missing/corrupt files directly from the official mPDF project's `ttfonts` directory. The repair uses the exact font directory used by Bit Form Pro at `wp-content/uploads/bitforms/fonts/`, restricts the downloads to four known filenames, checks that each file is a usable TrueType font, and provides specific HTTP/filesystem errors. It does not bundle fonts, modify Bit Form Pro, or change Post SMTP. The repair is an explicit admin action, not a hidden side effect of sending email.
+
+After repair, retry the same submission. If another font filename is reported, collect the specific exception; this repair focuses only on the diagnosed DejaVu Serif Condensed family. Upgrading the Bit Form Pro plugin itself may reintroduce other font dependencies. Check folder write permissions and outbound HTTPS from the WordPress PHP server if download fails.
+
+## DejaVu Serif Condensed font repair (0.4.3)
+
+For Bit Form Pro installations with the error `DejaVuSerifCondensed.ttf` not found, use the **Check DejaVu Serif Condensed font files** and **Repair missing font files** admin actions. Verify PDF rendering in Bit Form Pro itself before resending.

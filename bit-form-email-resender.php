@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bit Form Email Resender
  * Description: Safely resend configured Bit Form email notifications for stored submissions. Email-only; no submission or integration replay.
- * Version: 0.4.2
+ * Version: 0.4.3
  * Requires PHP: 8.0
  * Requires at least: 6.5
  * Author: Ihasan Iftekhar Labib
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 final class BF_Email_Resender {
-    const VERSION = '0.4.2';
+    const VERSION = '0.4.3';
     const HISTORY_OPTION = 'bf_email_resender_history_v1';
     const MAX_BATCH = 5;
     const PAGE_SLUG = 'bf-email-resender';
@@ -29,6 +29,8 @@ final class BF_Email_Resender {
         add_action('wp_ajax_bf_email_resender_preview', [__CLASS__, 'ajax_preview']);
         add_action('wp_ajax_bf_email_resender_test_mail', [__CLASS__, 'ajax_test_mail']);
         add_action('wp_ajax_bf_email_resender_pdf_self_test', [__CLASS__, 'ajax_pdf_self_test']);
+        add_action('wp_ajax_bf_email_resender_font_check', [__CLASS__, 'ajax_font_check']);
+        add_action('wp_ajax_bf_email_resender_font_repair', [__CLASS__, 'ajax_font_repair']);
         add_action('admin_notices', [__CLASS__, 'version_notice']);
     }
 
@@ -132,6 +134,12 @@ final class BF_Email_Resender {
             <p>Run a blank, temporary PDF test through Bit Form Pro / mPDF. It does not use or email submission data. The generated test file is removed immediately.</p>
             <button type="button" id="bfres-pdf-self-test" class="button">Test Bit Form Pro PDF generator</button>
             <p id="bfres-pdf-test-result" role="status" aria-live="polite"></p>
+            <h3>Missing mPDF font repair (DejaVu Serif Condensed)</h3>
+            <p>Bit Form Pro 3.4.0 includes DejaVu Sans but not DejaVu Serif Condensed. PDF template HTML or CSS may still request this family even after changing the default font. The status check inspects the actual font files in mPDF's search paths, not Bit Form's downloaded-font indicator.</p>
+            <button type="button" id="bfres-font-check" class="button">Check DejaVu Serif Condensed font files</button>
+            <button type="button" id="bfres-font-repair" class="button button-secondary">Repair missing font files</button>
+            <p class="description">Repair downloads only missing or invalid DejaVu Serif Condensed .ttf files from the official mPDF project to <code>wp-content/uploads/bitforms/fonts/</code>. It does not change PDF templates, other plugins, or SMTP settings. Requires outgoing HTTPS access and write permission.</p>
+            <div id="bfres-font-result" role="status" aria-live="polite"></div>
           </section>
           <p class="description">Step 2: Review a submission and click <strong>Confirm &amp; send emails</strong>. A successful recipient preview does not send any email.</p>
           <form method="get" class="bfres-filters">
@@ -648,6 +656,155 @@ final class BF_Email_Resender {
      * at whether a template was disabled, missing, or failed in the mPDF renderer.
      * Never return the PDF HTML, submitted field values, local file paths or PHP traces.
      */
+    /**
+     * Fonts required by mPDF's built-in dejavuSERIFcondensed family. Pro 3.4.0 ships
+     * only DejaVu Sans, and the built-in downloaded-font flag does not verify files.
+     * Do not accept arbitrary filenames or URLs from the browser.
+     */
+    private static function serif_condensed_fonts(): array {
+        return [
+            'DejaVuSerifCondensed.ttf',
+            'DejaVuSerifCondensed-Bold.ttf',
+            'DejaVuSerifCondensed-Italic.ttf',
+            'DejaVuSerifCondensed-BoldItalic.ttf',
+        ];
+    }
+
+    private static function font_dirs(): array {
+        if (!defined('BITFORMS_CONTENT_DIR') || !class_exists('\\BitApps\\BitFormPro\\Deps\\Mpdf\\Config\\ConfigVariables')) {
+            return [];
+        }
+        $defaults = (new \BitApps\BitFormPro\Deps\Mpdf\Config\ConfigVariables())->getDefaults();
+        $dirs = array_values(array_filter((array) ($defaults['fontDir'] ?? []), 'is_string'));
+        // Identical to Bit Form Pro Pdf::generator()'s appended custom font directory.
+        $dirs[] = rtrim(BITFORMS_CONTENT_DIR, '/\\') . DIRECTORY_SEPARATOR . 'fonts';
+        return $dirs;
+    }
+
+    /** Minimal TrueType file validation; reject truncated HTML/404 responses. */
+    private static function readable_ttf(string $path): bool {
+        if (!is_file($path) || !is_readable($path) || (int) filesize($path) < 10000) {
+            return false;
+        }
+        $handle = @fopen($path, 'rb');
+        if (!$handle) { return false; }
+        $magic = fread($handle, 4);
+        fclose($handle);
+        return $magic === "\x00\x01\x00\x00" || $magic === 'true' || $magic === 'OTTO';
+    }
+
+    /** Mimic mPDF's lookup order; a bad earlier file is not silently considered valid. */
+    private static function font_status(): array {
+        $dirs = self::font_dirs();
+        $status = [];
+        foreach (self::serif_condensed_fonts() as $font) {
+            $found = false;
+            $bad = false;
+            $where = '';
+            foreach ($dirs as $index => $dir) {
+                $path = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . $font;
+                if (file_exists($path)) {
+                    $found = self::readable_ttf($path);
+                    $bad = !$found;
+                    $where = $index === count($dirs) - 1 ? 'Bit Form uploads/fonts' : 'mPDF bundled fonts';
+                    // This is the first file mPDF would load, so do not skip corrupt files.
+                    break;
+                }
+            }
+            $status[] = [
+                'name' => $font,
+                'state' => $found ? 'available' : ($bad ? 'invalid' : 'missing'),
+                'where' => $where,
+            ];
+        }
+        return $status;
+    }
+
+    public static function ajax_font_check(): void {
+        if (!self::allowed()) { wp_send_json_error(['message' => 'Insufficient permissions.'], 403); }
+        check_ajax_referer('bf_email_resender_send', 'nonce');
+        if (!self::font_dirs()) {
+            wp_send_json_error(['message' => 'Bit Form Pro font paths are unavailable.'], 400);
+        }
+        $files = self::font_status();
+        $missing = count(array_filter($files, static fn($file) => $file['state'] !== 'available'));
+        wp_send_json_success([
+            'message' => $missing ? $missing . ' of 4 DejaVu Serif Condensed font files are missing or invalid.' : 'All 4 DejaVu Serif Condensed font files are available in the paths configured for mPDF.',
+            'files' => $files,
+        ]);
+    }
+
+    /**
+     * Explicit administrator action, NOT an automatic request while sending mail.
+     * Downloads only the four known filenames into Bit Form Pro's registered fontDir.
+     * Files are verified as TrueType before being atomically moved into place.
+     */
+    public static function ajax_font_repair(): void {
+        if (!self::allowed()) { wp_send_json_error(['message' => 'Insufficient permissions.'], 403); }
+        check_ajax_referer('bf_email_resender_send', 'nonce');
+        if (!self::font_dirs()) {
+            wp_send_json_error(['message' => 'Bit Form Pro font paths are unavailable.'], 400);
+        }
+        $dir = rtrim(BITFORMS_CONTENT_DIR, '/\\') . DIRECTORY_SEPARATOR . 'fonts';
+        if ((!is_dir($dir) && !wp_mkdir_p($dir)) || !is_dir($dir) || !is_writable($dir)) {
+            wp_send_json_error(['message' => 'Bit Form uploads/fonts does not exist and could not be created or is not writable. Check WordPress upload folder permissions.'], 400);
+        }
+        $repaired = [];
+        $errors = [];
+        foreach (self::serif_condensed_fonts() as $filename) {
+            $path = $dir . DIRECTORY_SEPARATOR . $filename;
+            $already_available = false;
+            foreach (self::font_status() as $item) {
+                if ($item['name'] === $filename && $item['state'] === 'available') { $already_available = true; break; }
+            }
+            if ($already_available) { continue; }
+            $temporary = @tempnam($dir, '.bfres-');
+            if (!$temporary) {
+                $errors[] = $filename . ': Could not create temporary file.';
+                continue;
+            }
+            $url = 'https://raw.githubusercontent.com/mpdf/mpdf/master/ttfonts/' . $filename;
+            $response = wp_safe_remote_get($url, [
+                'timeout' => 45,
+                'redirection' => 2,
+                'stream' => true,
+                'filename' => $temporary,
+                'limit_response_size' => 5000000,
+            ]);
+            if (is_wp_error($response)) {
+                $errors[] = $filename . ': ' . self::safe_pdf_error($response->get_error_message());
+                @unlink($temporary);
+                continue;
+            }
+            $code = (int) wp_remote_retrieve_response_code($response);
+            if ($code !== 200 || !self::readable_ttf($temporary)) {
+                $errors[] = $filename . ': Download returned HTTP ' . $code . ' or the downloaded file is not a readable TrueType font.';
+                @unlink($temporary);
+                continue;
+            }
+            if (!@rename($temporary, $path)) {
+                $errors[] = $filename . ': Cannot move font into Bit Form uploads/fonts (permissions).';
+                @unlink($temporary);
+                continue;
+            }
+            @chmod($path, 0644);
+            clearstatcache(true, $path);
+            if (!self::readable_ttf($path)) {
+                $errors[] = $filename . ': File still cannot be read after download.';
+            } else {
+                $repaired[] = $filename;
+            }
+        }
+        $files = self::font_status();
+        $missing = count(array_filter($files, static fn($file) => $file['state'] !== 'available'));
+        wp_send_json_success([
+            'message' => 'Repaired ' . count($repaired) . ' font file(s); ' . (4 - $missing) . '/4 available.' . ($missing ? ' Some fonts are still unavailable; check the error details.' : ' Try the original PDF resend again.'),
+            'repaired' => $repaired,
+            'errors' => $errors,
+            'files' => $files,
+        ]);
+    }
+
     /** Return a bounded, admin-only error description without submitting PDF HTML or credentials. */
     private static function safe_pdf_error(string $raw): string {
         $raw = wp_strip_all_tags($raw);

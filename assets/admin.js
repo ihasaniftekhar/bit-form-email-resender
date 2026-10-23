@@ -71,6 +71,34 @@
       testMailButton.disabled = false;
     }
   });
+  const fontCheckButton = document.getElementById('bfres-font-check');
+  const fontRepairButton = document.getElementById('bfres-font-repair');
+  const fontResult = document.getElementById('bfres-font-result');
+  const showFontStatus = data => {
+    if (!fontResult) return;
+    fontResult.replaceChildren();
+    append(fontResult, 'p', data.message || 'Font check completed.');
+    for (const entry of data.files || []) {
+      append(fontResult, 'div', entry.name + ': ' + entry.state + (entry.where ? ' (' + entry.where + ')' : ''));
+    }
+    for (const error of data.errors || []) { append(fontResult, 'p', '⚠ ' + error); }
+  };
+  fontCheckButton?.addEventListener('click', async () => {
+    fontCheckButton.disabled = true;
+    fontResult.textContent = 'Checking installed font files…';
+    try { showFontStatus(await request('bf_email_resender_font_check', [])); }
+    catch (e) { fontResult.textContent = 'Font check failed: ' + e.message; }
+    finally { fontCheckButton.disabled = false; }
+  });
+  fontRepairButton?.addEventListener('click', async () => {
+    if (!window.confirm('Download missing DejaVu Serif Condensed font files from the official mPDF project into Bit Form’s uploads/fonts folder?')) return;
+    fontRepairButton.disabled = true;
+    fontCheckButton.disabled = true;
+    fontResult.textContent = 'Checking and repairing missing fonts…';
+    try { showFontStatus(await request('bf_email_resender_font_repair', [])); }
+    catch (e) { fontResult.textContent = 'Font repair failed: ' + e.message; }
+    finally { fontRepairButton.disabled = false; fontCheckButton.disabled = false; }
+  });
   const pdfTestButton = document.getElementById('bfres-pdf-self-test');
   const pdfTestResult = document.getElementById('bfres-pdf-test-result');
   pdfTestButton?.addEventListener('click', async () => {
