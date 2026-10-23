@@ -1,6 +1,6 @@
 # Release history and reported issues
 
-Historical versions are preserved in separate Git commits and tags. The `dist/` directory contains one independently installable ZIP per version.
+Historical versions are preserved in separate Git commits. The `dist/` directory contains one independently installable ZIP per version. Release tags exist in the local publishing bundle but have not been pushed to GitHub.
 
 | Version | Change | Reported limitation or error |
 | --- | --- | --- |
