@@ -1,0 +1,12 @@
+.bfres-wrap { max-width: 1180px; }
+.bfres-filters, .bfres-actions { display:flex;flex-wrap:wrap;align-items:center;gap:12px; padding:16px; margin:18px 0; background:#fff; border:1px solid #dcdcde; border-radius:6px; }
+.bfres-filters select, .bfres-actions select { min-width:240px;max-width:500px; }
+#bfres-progress { padding-left:8px; font-weight:500; }
+.bfres-result {display:block;max-width:470px;overflow-wrap:anywhere}
+.bfres-accepted { color:#166534; }
+.bfres-partial,.bfres-error { color:#a3301b; }
+.bfres-skipped { color:#666; }
+#bfres-entries th:nth-child(2) { width: 90px; }
+#bfres-entries th:nth-child(4) { width: 155px; }
+#bfres-entries th:nth-child(6) { width: 140px; }
+.bfres-wrap h2 { margin-top:34px; }
