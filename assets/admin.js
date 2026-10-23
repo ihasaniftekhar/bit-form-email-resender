@@ -7,58 +7,169 @@
   const bulk = document.getElementById('bfres-bulk');
   const template = document.getElementById('bfres-template');
   const buttons = [...document.querySelectorAll('.bfres-one')];
+  const panel = document.getElementById('bfres-preview');
+  const summary = document.getElementById('bfres-preview-summary');
+  const custom = document.getElementById('bfres-custom');
+  const to = document.getElementById('bfres-to');
+  const cc = document.getElementById('bfres-cc');
+  const bcc = document.getElementById('bfres-bcc');
+  const confirm = document.getElementById('bfres-confirm');
+  const cancel = document.getElementById('bfres-cancel');
   let busy = false;
+  let reviewedIds = [];
+  let reviewedTemplate = '0';
+  let reviewable = false;
+
   const selected = () => [...document.querySelectorAll('.bfres-check:checked')].map(x => Number(x.value));
+  const setBusy = state => {
+    busy = state;
+    bulk.disabled = state;
+    buttons.forEach(b => b.disabled = state);
+    confirm.disabled = state;
+  };
   all.addEventListener('change', () => document.querySelectorAll('.bfres-check').forEach(x => x.checked = all.checked));
-  const send = async (ids) => {
+  const append = (parent, tag, value) => {
+    const el = document.createElement(tag);
+    el.textContent = value;
+    parent.appendChild(el);
+    return el;
+  };
+  const request = async (action, ids, extra = {}) => {
+    const params = new URLSearchParams();
+    params.append('action', action);
+    params.append('nonce', bfEmailResender.nonce);
+    params.append('form_id', table.dataset.formId);
+    params.append('template_id', reviewedTemplate);
+    ids.forEach(id => params.append('entry_ids[]', String(id)));
+    Object.entries(extra).forEach(([key, value]) => params.append(key, value));
+    const response = await fetch(bfEmailResender.ajaxUrl, { method: 'POST', body: params, credentials: 'same-origin' });
+    let body;
+    try { body = await response.json(); }
+    catch (_) { throw new Error('Unexpected server response (not JSON). Check WordPress/PHP error logs. HTTP ' + response.status); }
+    if (!response.ok || !body.success) throw new Error(body?.data?.message || ('Request failed (HTTP ' + response.status + ').'));
+    return body.data;
+  };
+  const mode = () => document.querySelector('input[name="bfres-recipient-mode"]:checked').value;
+  document.querySelectorAll('input[name="bfres-recipient-mode"]').forEach(radio => {
+    radio.addEventListener('change', () => { custom.hidden = mode() !== 'custom'; });
+  });
+  const review = async (ids) => {
     if (busy || !ids.length) return;
+    if (ids.length > bfEmailResender.previewMax) {
+      progress.textContent = `Select no more than ${bfEmailResender.previewMax} entries at a time.`;
+      return;
+    }
+    panel.hidden = false;
+    summary.replaceChildren();
+    append(summary, 'p', 'Loading recipient details…');
+    progress.textContent = '';
+    setBusy(true);
+    reviewedIds = ids;
+    reviewedTemplate = template.value;
+    reviewable = false;
+    try {
+      const data = await request('bf_email_resender_preview', ids);
+      summary.replaceChildren();
+      let count = 0;
+      let errors = 0;
+      const allAddresses = { to: new Set(), cc: new Set(), bcc: new Set() };
+      for (const entry of data.entries) {
+        const section = document.createElement('div');
+        section.className = 'bfres-review-entry';
+        append(section, 'strong', 'Entry #' + entry.entry_id);
+        if (entry.error) { append(section, 'p', entry.error); errors++; }
+        else if (!entry.notifications.length) { append(section, 'p', 'No notifications match the current submission conditions.'); errors++; }
+        else {
+          for (const notice of entry.notifications) {
+            count++;
+            const sub = document.createElement('p');
+            append(sub, 'strong', notice.template + ': ');
+            for (const field of ['to', 'cc', 'bcc']) {
+              (notice[field] || []).forEach(address => allAddresses[field].add(address));
+              const text = (notice[field] || []).join(', ') || '(none)';
+              append(sub, 'span', field.toUpperCase() + ' ' + text + ' · ');
+            }
+            section.appendChild(sub);
+          }
+        }
+        summary.appendChild(section);
+      }
+      append(summary, 'p', count + ' notification(s) eligible across ' + ids.length + ' submission(s).' + (errors ? ' ' + errors + ' entry/entries need attention.' : ''));
+      // Original recipients are visible for all entries above. When editing one entry,
+      // populate editable fields with that entry's recipient list by default.
+      // For a bulk edit don't combine unrelated entries' addresses into a new global To.
+      const single = ids.length === 1;
+      to.value = single ? [...allAddresses.to].join(', ') : '';
+      cc.value = single ? [...allAddresses.cc].join(', ') : '';
+      bcc.value = single ? [...allAddresses.bcc].join(', ') : '';
+      document.querySelector('input[name="bfres-recipient-mode"][value="original"]').checked = true;
+      custom.hidden = true;
+      reviewable = count > 0;
+      if (count === 0) progress.textContent = 'No matching email notifications to send. Review the selected form and notification template.';
+    } catch (e) {
+      summary.replaceChildren();
+      append(summary, 'p', 'Could not load email recipients: ' + e.message);
+      progress.textContent = 'Recipient review failed. No email has been sent.';
+      reviewable = false;
+    } finally {
+      setBusy(false);
+      confirm.disabled = !reviewable;
+    }
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
+  const send = async () => {
+    if (busy || !reviewedIds.length) return;
+    const recipientMode = mode();
+    const options = { recipient_mode: recipientMode };
+    if (recipientMode === 'custom') {
+      const parse = raw => raw.split(/[,;\r\n]+/).map(x => x.trim()).filter(Boolean);
+      const validate = raw => parse(raw).every(x => /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(x));
+      if (!parse(to.value).length || ![to.value, cc.value, bcc.value].every(validate)) {
+        window.alert('Enter at least one valid To email address. Separate multiple addresses with commas or new lines.');
+        return;
+      }
+      options.recipient_to = to.value;
+      options.recipient_cc = cc.value;
+      options.recipient_bcc = bcc.value;
+    }
     const label = template.options[template.selectedIndex]?.text || 'selected notification';
-    const yes = window.confirm(`Resend ${label} for ${ids.length} selected submission(s)? This will send real emails to the currently configured recipients.`);
-    if (!yes) return;
-    busy = true;
-    bulk.disabled = true;
-    buttons.forEach(x => x.disabled = true);
-    progress.textContent = `Preparing ${ids.length} submission(s)…`;
+    if (template.value !== reviewedTemplate) { window.alert('Notification selection changed. Review recipients again.'); return; }
+    const msg = recipientMode === 'original'
+      ? 'Send to the original recipients calculated from the current Bit Form configuration?'
+      : 'REPLACE original recipients with the custom To/CC/BCC addresses shown?';
+    if (!window.confirm(`Send ${label} for ${reviewedIds.length} submission(s)?\n\n${msg}\n\nThis sends real emails.`)) return;
+    setBusy(true);
     let complete = 0;
     let issues = 0;
-    const results = [];
     try {
-      for (let i = 0; i < ids.length; i += bfEmailResender.maxBatch) {
-        const group = ids.slice(i, i + bfEmailResender.maxBatch);
-        const params = new URLSearchParams();
-        params.append('action', 'bf_email_resender_send');
-        params.append('nonce', bfEmailResender.nonce);
-        params.append('form_id', table.dataset.formId);
-        params.append('template_id', template.value);
-        group.forEach(id => params.append('entry_ids[]', String(id)));
-        const response = await fetch(bfEmailResender.ajaxUrl, { method: 'POST', body: params, credentials: 'same-origin' });
-        const body = await response.json();
-        if (!response.ok || !body.success) throw new Error(body?.data?.message || 'Server request failed.');
-        for (const item of body.data.results) {
+      for (let i = 0; i < reviewedIds.length; i += bfEmailResender.maxBatch) {
+        const ids = reviewedIds.slice(i, i + bfEmailResender.maxBatch);
+        const data = await request('bf_email_resender_send', ids, options);
+        for (const item of data.results) {
           const dest = document.querySelector(`.bfres-result[data-id="${item.entry_id}"]`);
           if (dest) {
             dest.textContent = (item.status === 'accepted' ? '✓ ' : item.status === 'skipped' ? '— ' : '⚠ ') + item.message;
             dest.className = 'bfres-result bfres-' + item.status;
           }
           if (item.status !== 'accepted') issues++;
-          results.push(item);
           complete++;
         }
-        progress.textContent = `${complete} / ${ids.length} processed (${issues} requiring attention)`;
+        progress.textContent = `${complete} / ${reviewedIds.length} processed (${issues} requiring attention)`;
       }
-      progress.textContent += '. Reload to view updated history.';
+      panel.hidden = true;
+      progress.textContent += '. Reload this page for the updated resend history.';
     } catch (e) {
-      progress.textContent = `Stopped after ${complete} / ${ids.length}. ${e.message} Check the results before retrying to avoid duplicates.`;
+      progress.textContent = `Stopped after ${complete} / ${reviewedIds.length}. ${e.message} Check the results before retrying to avoid duplicates.`;
     } finally {
-      busy = false;
-      bulk.disabled = false;
-      buttons.forEach(x => x.disabled = false);
+      setBusy(false);
     }
   };
+  cancel.addEventListener('click', () => { panel.hidden = true; reviewedIds = []; });
+  confirm.addEventListener('click', send);
   bulk.addEventListener('click', () => {
     const ids = selected();
     if (!ids.length) { window.alert('Select one or more entries first.'); return; }
-    send(ids);
+    review(ids);
   });
-  buttons.forEach(button => button.addEventListener('click', () => send([Number(button.dataset.id)])));
+  buttons.forEach(button => button.addEventListener('click', () => review([Number(button.dataset.id)])));
 })();

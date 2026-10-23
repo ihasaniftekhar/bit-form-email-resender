@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bit Form Email Resender
  * Description: Safely resend configured Bit Form email notifications for stored submissions. Email-only; no submission or integration replay.
- * Version: 0.1.0
+ * Version: 0.2.0
  * Requires PHP: 8.0
  * Requires at least: 6.5
  * Author: Ihasan Iftekhar Labib
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 final class BF_Email_Resender {
-    const VERSION = '0.1.0';
+    const VERSION = '0.2.0';
     const HISTORY_OPTION = 'bf_email_resender_history_v1';
     const MAX_BATCH = 5;
     const PAGE_SLUG = 'bf-email-resender';
@@ -25,6 +25,7 @@ final class BF_Email_Resender {
         add_action('admin_menu', [__CLASS__, 'register_menu'], 30);
         add_action('admin_enqueue_scripts', [__CLASS__, 'enqueue']);
         add_action('wp_ajax_bf_email_resender_send', [__CLASS__, 'ajax_send']);
+        add_action('wp_ajax_bf_email_resender_preview', [__CLASS__, 'ajax_preview']);
         add_action('admin_notices', [__CLASS__, 'version_notice']);
     }
 
@@ -72,6 +73,7 @@ final class BF_Email_Resender {
             'ajaxUrl' => admin_url('admin-ajax.php'),
             'nonce'   => wp_create_nonce('bf_email_resender_send'),
             'maxBatch'=> self::MAX_BATCH,
+            'previewMax' => 25,
         ]);
     }
 
@@ -130,9 +132,26 @@ final class BF_Email_Resender {
                <option value="<?php echo esc_attr((int) $t->id); ?>"><?php echo esc_html(($t->title ?: 'Email notification') . ' (#' . (int) $t->id . ')'); ?></option>
             <?php endforeach; ?>
             </select>
-            <button type="button" id="bfres-bulk" class="button button-primary">Resend selected</button>
+            <button type="button" id="bfres-bulk" class="button button-primary">Review &amp; resend selected</button>
             <span id="bfres-progress" aria-live="polite"></span>
           </div>
+          <?php if (!$templates): ?>
+          <div class="notice notice-warning inline"><p>No enabled email notification templates were found for this form. Configure an enabled notification in Bit Form first.</p></div>
+          <?php endif; ?>
+          <section class="bfres-preview" id="bfres-preview" hidden aria-label="Review resend recipients">
+            <h2>Review email recipients</h2>
+            <div id="bfres-preview-summary" aria-live="polite"></div>
+            <p class="description">Original recipients are calculated from the currently configured Bit Form notification(s) and the saved entry values. They may differ from the actual historical recipients if the form settings have since changed.</p>
+            <div class="bfres-mode"><label><input type="radio" name="bfres-recipient-mode" value="original" checked> Use original recipients (default)</label>
+            <label><input type="radio" name="bfres-recipient-mode" value="custom"> Replace with different recipients</label></div>
+            <div class="bfres-custom" id="bfres-custom" hidden>
+              <p><label for="bfres-to">To <span class="required">*</span></label><textarea id="bfres-to" rows="2" placeholder="name@example.com, another@example.com"></textarea></p>
+              <p><label for="bfres-cc">CC (optional)</label><input type="text" id="bfres-cc" placeholder="cc@example.com"></p>
+              <p><label for="bfres-bcc">BCC (optional)</label><input type="text" id="bfres-bcc" placeholder="bcc@example.com"></p>
+              <p class="description"><strong>Privacy:</strong> In custom mode, only the addresses written here receive these emails. Original To/CC/BCC and conditional routing are replaced. Separate addresses using commas or new lines.</p>
+            </div>
+            <div class="bfres-preview-actions"><button type="button" id="bfres-confirm" class="button button-primary">Confirm &amp; send emails</button><button type="button" id="bfres-cancel" class="button">Cancel</button></div>
+          </section>
           <table class="wp-list-table widefat fixed striped" id="bfres-entries" data-form-id="<?php echo esc_attr($form_id); ?>">
             <thead><tr><td class="check-column"><input type="checkbox" id="bfres-all" aria-label="Select all visible submissions"></td><th>Entry ID</th><th>Contact</th><th>Submitted</th><th>Notification status</th><th>Action</th></tr></thead>
             <tbody>
@@ -143,7 +162,7 @@ final class BF_Email_Resender {
               <td><?php echo esc_html(implode(' · ', $summaries[(int) $row->id] ?? [])); ?></td>
               <td><?php echo esc_html($row->created_at); ?></td>
               <td><span class="bfres-result" data-id="<?php echo esc_attr($row->id); ?>">Not resent here</span></td>
-              <td><button type="button" class="button bfres-one" data-id="<?php echo esc_attr($row->id); ?>">Resend email</button></td>
+              <td><button type="button" class="button bfres-one" data-id="<?php echo esc_attr($row->id); ?>">Review &amp; resend</button></td>
             </tr>
             <?php endforeach; ?>
             <?php if (!$rows): ?><tr><td colspan="6">No eligible submissions were found.</td></tr><?php endif; ?>
@@ -157,7 +176,7 @@ final class BF_Email_Resender {
             ])); ?>
           </div></div>
           <?php endif; ?>
-          <?php else: ?><p>Select an available form after activating Bit Form Free 3.4.0.</p><?php endif; ?>
+          <?php else: ?><p><?php echo $form_id ? 'Bit Form Free 3.4.0 is not active or compatible.' : 'No forms found. Create a form in Bit Form first.'; ?></p><?php endif; ?>
           <h2>Recent resend activity</h2>
           <table class="widefat striped"><thead><tr><th>Time</th><th>Form / entry</th><th>Emails accepted / attempted</th><th>Result</th><th>By</th></tr></thead><tbody>
           <?php foreach (array_slice(array_reverse($history), 0, 30) as $h): ?>
@@ -369,6 +388,125 @@ final class BF_Email_Resender {
         }
     }
 
+    /** Validate a literal list of replacement email addresses, never smart tags. */
+    private static function parse_recipient_input($raw): array {
+        if (!is_string($raw) || strlen($raw) > 3000) {
+            throw new \InvalidArgumentException('Recipient addresses must be plain text (up to 3000 characters).');
+        }
+        if (trim($raw) === '') { return []; }
+        $items = preg_split('/[,;\r\n]+/', $raw);
+        if (count($items) > 30) {
+            throw new \InvalidArgumentException('Too many addresses (maximum 30 per field).');
+        }
+        $found = [];
+        foreach ($items as $item) {
+            $address = trim($item);
+            if (!$address) { continue; }
+            if (!is_email($address) || preg_match('/[<>\x00-\x1F]/', $address)) {
+                throw new \InvalidArgumentException('Invalid email address: ' . wp_html_excerpt($address, 90, ''));
+            }
+            $found[strtolower($address)] = sanitize_email($address);
+        }
+        return array_values($found);
+    }
+
+    /** A shared, read-only entry loader for preview and sending. */
+    private static function entry_context(int $form_id, int $entry_id): array {
+        global $wpdb;
+        $entry = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, status FROM `{$wpdb->prefix}bitforms_form_entries` WHERE id = %d AND form_id = %d", $entry_id, $form_id
+        ));
+        if (!$entry || (int) $entry->status === 2) {
+            throw new \RuntimeException('Submission not found or trashed.');
+        }
+        $meta = $wpdb->get_results($wpdb->prepare(
+            "SELECT meta_key, meta_value FROM `{$wpdb->prefix}bitforms_form_entrymeta` WHERE bitforms_form_entry_id = %d", $entry_id
+        ));
+        if ($wpdb->last_error) {
+            throw new \RuntimeException('Cannot read submission metadata; check Bit Form database tables.');
+        }
+        $values = [];
+        foreach ((array) $meta as $m) { $values[$m->meta_key] = $m->meta_value; }
+        $manager = new \BitApps\BitForm\Services\Admin\AdminFormManager($form_id);
+        if (!$manager->isExist()) { throw new \RuntimeException('Form configuration unavailable.'); }
+        $content = $manager->getFormContent();
+        if (!isset($content->fields) || !is_object($content->fields)) {
+            throw new \RuntimeException('Cannot load form fields.');
+        }
+        $fields = $content->fields;
+        foreach ($fields as $key => $fld) {
+            if (array_key_exists($key, $values)) {
+                $fld->val = $values[$key];
+                $fld->name = $key;
+            }
+        }
+        $resolved = self::resolve_notifications($form_id, $entry_id, $values, $fields);
+        $formatted = \BitApps\BitForm\Helpers\FieldValueHandler::formatFieldValueForMail($fields, $resolved['values']);
+        return ['notifications' => $resolved['notifications'], 'formatted' => $formatted];
+    }
+
+    /** Fully resolve notification routing as Bit Form would, for the current saved entry. */
+    private static function preview_notification_recipients(array $item, array $formatted, int $form_id): array {
+        $details = $item['details'];
+        $handler = \BitApps\BitForm\Helpers\FieldValueHandler::class;
+        $to = $handler::validateMailArry($details->to, $formatted);
+        $to = apply_filters('bitform_email_conditional_routing', $to, $item['template'], $formatted, $form_id);
+        $get = static function($value) use ($handler, $formatted) {
+            $addresses = [];
+            foreach ((array) $handler::validateMailArry($value, $formatted) as $addr) {
+                if (is_string($addr) && is_email($addr)) { $addresses[strtolower($addr)] = sanitize_email($addr); }
+            }
+            return array_values($addresses);
+        };
+        $only_valid = static function($list) {
+            $out = [];
+            foreach ((array) $list as $address) {
+                if (is_string($address) && is_email($address)) { $out[strtolower($address)] = sanitize_email($address); }
+            }
+            return array_values($out);
+        };
+        return ['template_id' => (int) $item['template']->id,
+            'template' => (string) ($item['template']->title ?: ('Template #' . $item['template']->id)),
+            'to' => $only_valid($to), 'cc' => $get($details->cc), 'bcc' => $get($details->bcc)];
+    }
+
+    public static function ajax_preview(): void {
+        if (!self::allowed() || !check_ajax_referer('bf_email_resender_send', 'nonce', false)) {
+            wp_send_json_error(['message' => 'Permission or security token check failed. Reload and retry.'], 403);
+        }
+        if (!self::available()) {
+            wp_send_json_error(['message' => 'Bit Form Free 3.4.0 is required and must be active.'], 409);
+        }
+        $form_id = absint($_POST['form_id'] ?? 0);
+        $template_id = absint($_POST['template_id'] ?? 0);
+        $input = isset($_POST['entry_ids']) ? wp_unslash($_POST['entry_ids']) : [];
+        $ids = is_array($input) ? array_values(array_unique(array_filter(array_map('absint', $input)))) : [];
+        if (!$form_id || !$ids || count($ids) > 25) {
+            wp_send_json_error(['message' => 'Select between 1 and 25 submissions.'], 400);
+        }
+        global $wpdb;
+        if (!$wpdb->get_var($wpdb->prepare("SELECT id FROM `{$wpdb->prefix}bitforms_form` WHERE id = %d AND status <> 2", $form_id))) {
+            wp_send_json_error(['message' => 'Form not found.'], 404);
+        }
+        $result = [];
+        foreach ($ids as $id) {
+            try {
+                $context = self::entry_context($form_id, $id);
+                $notifications = $template_id ? array_values(array_filter($context['notifications'], static function($n) use($template_id) {
+                    return (int) $n['template']->id === $template_id;
+                })) : $context['notifications'];
+                $notices = [];
+                foreach ($notifications as $item) {
+                    $notices[] = self::preview_notification_recipients($item, $context['formatted'], $form_id);
+                }
+                $result[] = ['entry_id' => $id, 'notifications' => $notices];
+            } catch (\Throwable $e) {
+                $result[] = ['entry_id' => $id, 'error' => $e->getMessage(), 'notifications' => []];
+            }
+        }
+        wp_send_json_success(['entries' => $result]);
+    }
+
     public static function ajax_send(): void {
         if (!self::allowed()) {
             wp_send_json_error(['message' => 'Insufficient permissions.'], 403);
@@ -386,6 +524,24 @@ final class BF_Email_Resender {
             wp_send_json_error(['message' => 'Invalid entry selection.'], 400);
         }
         $ids = array_values(array_unique(array_filter(array_map('absint', $ids_input))));
+        $mode_raw = wp_unslash($_POST['recipient_mode'] ?? 'original');
+        $mode = is_string($mode_raw) ? sanitize_key($mode_raw) : '';
+        if (!in_array($mode, ['original', 'custom'], true)) {
+            wp_send_json_error(['message' => 'Invalid recipient mode.'], 400);
+        }
+        $recipient_override = null;
+        if ($mode === 'custom') {
+            try {
+                $recipient_override = [
+                    'to'  => self::parse_recipient_input(wp_unslash($_POST['recipient_to'] ?? '')),
+                    'cc'  => self::parse_recipient_input(wp_unslash($_POST['recipient_cc'] ?? '')),
+                    'bcc' => self::parse_recipient_input(wp_unslash($_POST['recipient_bcc'] ?? '')),
+                ];
+                if (!$recipient_override['to']) { throw new \InvalidArgumentException('At least one valid To recipient is required.'); }
+            } catch (\InvalidArgumentException $e) {
+                wp_send_json_error(['message' => $e->getMessage()], 400);
+            }
+        }
         if (!$form_id || !$ids || count($ids) > self::MAX_BATCH) {
             wp_send_json_error(['message' => 'Choose between 1 and ' . self::MAX_BATCH . ' submissions.'], 400);
         }
@@ -398,7 +554,7 @@ final class BF_Email_Resender {
         $results = [];
         foreach ($ids as $id) {
             try {
-                $results[] = self::send_entry($form_id, $id, $template_id);
+                $results[] = self::send_entry($form_id, $id, $template_id, $recipient_override);
             } catch (\Throwable $e) {
                 $results[] = ['entry_id' => $id, 'status' => 'error', 'message' => 'Unexpected send error: ' . $e->getMessage()];
             }
@@ -406,16 +562,8 @@ final class BF_Email_Resender {
         wp_send_json_success(['results' => $results]);
     }
 
-    private static function send_entry(int $form_id, int $entry_id, int $template_id): array {
+    private static function send_entry(int $form_id, int $entry_id, int $template_id, ?array $recipient_override): array {
         global $wpdb;
-        $entries_table = $wpdb->prefix . 'bitforms_form_entries';
-        $meta_table = $wpdb->prefix . 'bitforms_form_entrymeta';
-        $entry = $wpdb->get_row($wpdb->prepare(
-            "SELECT id, status FROM `{$entries_table}` WHERE id = %d AND form_id = %d", $entry_id, $form_id
-        ));
-        if (!$entry || (int) $entry->status === 2) {
-            return ['entry_id' => $entry_id, 'status' => 'error', 'message' => 'Submission not found or not eligible.'];
-        }
         // Atomic lock prevents duplicate email bursts when multiple admins click at once.
         $lock = 'bfres_lock_' . $form_id . '_' . $entry_id;
         $locked = add_option($lock, time(), '', false);
@@ -430,31 +578,13 @@ final class BF_Email_Resender {
             return ['entry_id' => $entry_id, 'status' => 'error', 'message' => 'A resend for this entry is already in progress.'];
         }
         try {
-            $values = [];
-            $meta = $wpdb->get_results($wpdb->prepare(
-                "SELECT meta_key, meta_value FROM `{$meta_table}` WHERE bitforms_form_entry_id = %d", $entry_id
-            ));
-            foreach ((array) $meta as $m) {
-                $values[$m->meta_key] = $m->meta_value;
+            try {
+                $context = self::entry_context($form_id, $entry_id);
+            } catch (\Throwable $e) {
+                return ['entry_id' => $entry_id, 'status' => 'error', 'message' => $e->getMessage()];
             }
-            $manager = new \BitApps\BitForm\Services\Admin\AdminFormManager($form_id);
-            if (!$manager->isExist()) {
-                return ['entry_id' => $entry_id, 'status' => 'error', 'message' => 'Form configuration is unavailable.'];
-            }
-            $content = $manager->getFormContent();
-            if (!isset($content->fields) || !is_object($content->fields)) {
-                return ['entry_id' => $entry_id, 'status' => 'error', 'message' => 'Form fields could not be loaded.'];
-            }
-            $fields = $content->fields;
-            foreach ($fields as $key => $fld) {
-                if (array_key_exists($key, $values)) {
-                    $fld->val = $values[$key];
-                    $fld->name = $key;
-                }
-            }
-            $resolved = self::resolve_notifications($form_id, $entry_id, $values, $fields);
-            $found = $resolved['notifications'];
-            $values = $resolved['values'];
+            $found = $context['notifications'];
+            $formatted = $context['formatted'];
             if ($template_id) {
                 $found = array_values(array_filter($found, static function($n) use($template_id) {
                     return (int) $n['template']->id === $template_id;
@@ -463,7 +593,6 @@ final class BF_Email_Resender {
             if (!$found) {
                 return ['entry_id' => $entry_id, 'status' => 'skipped', 'message' => 'No enabled notifications match the submission and workflow rules.'];
             }
-            $formatted = \BitApps\BitForm\Helpers\FieldValueHandler::formatFieldValueForMail($fields, $values);
             $accepted = 0;
             $attempted = 0;
             $errors = [];
@@ -508,14 +637,25 @@ final class BF_Email_Resender {
                 add_filter('wp_mail', $capture, PHP_INT_MAX);
                 add_action('wp_mail_succeeded', $success, PHP_INT_MAX);
                 add_action('wp_mail_failed', $failure, PHP_INT_MAX);
+                $details = clone $item['details'];
+                // Custom recipient mode must remove every original recipient, including Pro conditional routes.
+                $route_override = null;
+                if (null !== $recipient_override) {
+                    $details->to = $recipient_override['to'];
+                    $details->cc = $recipient_override['cc'];
+                    $details->bcc = $recipient_override['bcc'];
+                    $route_override = static function() use ($recipient_override) { return $recipient_override['to']; };
+                    add_filter('bitform_email_conditional_routing', $route_override, PHP_INT_MAX);
+                }
                 try {
                     \BitApps\BitForm\Services\Notification\MailNotifier::notify(
-                        $item['details'], $form_id, $formatted, $entry_id, false, $log_id
+                        $details, $form_id, $formatted, $entry_id, false, $log_id
                     );
                 } catch (\Throwable $e) {
                     $failed_in_this_call = true;
                     $seen_errors[] = $e->getMessage();
                 } finally {
+                    if (null !== $route_override) { remove_filter('bitform_email_conditional_routing', $route_override, PHP_INT_MAX); }
                     remove_filter('wp_mail', $capture, PHP_INT_MAX);
                     remove_action('wp_mail_succeeded', $success, PHP_INT_MAX);
                     remove_action('wp_mail_failed', $failure, PHP_INT_MAX);
@@ -532,6 +672,7 @@ final class BF_Email_Resender {
                 'time' => current_time('mysql'), 'form' => $form_id, 'entry' => $entry_id,
                 'attempted' => $attempted, 'accepted' => $accepted, 'status' => $status,
                 'user' => (string) wp_get_current_user()->user_login,
+                'recipient_mode' => $recipient_override === null ? 'original' : 'custom',
                 'to' => array_values(array_unique($addresses)),
             ]);
             return ['entry_id' => $entry_id, 'status' => $status, 'accepted' => $accepted, 'attempted' => $attempted, 'message' => $message];
