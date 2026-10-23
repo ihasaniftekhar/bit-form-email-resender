@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bit Form Email Resender
  * Description: Safely resend configured Bit Form email notifications for stored submissions. Email-only; no submission or integration replay.
- * Version: 0.3.0
+ * Version: 0.4.0
  * Requires PHP: 8.0
  * Requires at least: 6.5
  * Author: Ihasan Iftekhar Labib
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 final class BF_Email_Resender {
-    const VERSION = '0.3.0';
+    const VERSION = '0.4.0';
     const HISTORY_OPTION = 'bf_email_resender_history_v1';
     const MAX_BATCH = 5;
     const PAGE_SLUG = 'bf-email-resender';
@@ -153,9 +153,9 @@ final class BF_Email_Resender {
           <div class="notice notice-warning inline"><p>No enabled email notification templates were found for this form. Configure an enabled notification in Bit Form first.</p></div>
           <?php endif; ?>
           <section class="bfres-preview" id="bfres-preview" hidden aria-label="Review resend recipients">
-            <h2>Review email recipients</h2>
+            <h2>Review recipients and PDF attachments</h2>
             <div id="bfres-preview-summary" aria-live="polite"></div>
-            <p class="description">Original recipients are calculated from the currently configured Bit Form notification(s) and the saved entry values. They may differ from the actual historical recipients if the form settings have since changed.</p>
+            <p class="description">PDF templates can be selected for each email notification below. If a PDF is missing from the default selections, check its box before sending. Original recipients are calculated from the currently configured Bit Form notification(s) and the saved entry values. They may differ from the actual historical recipients if the form settings have since changed.</p>
             <div class="bfres-mode"><label><input type="radio" name="bfres-recipient-mode" value="original" checked> Use original recipients (default)</label>
             <label><input type="radio" name="bfres-recipient-mode" value="custom"> Replace with different recipients</label></div>
             <div class="bfres-custom" id="bfres-custom" hidden>
@@ -271,9 +271,77 @@ final class BF_Email_Resender {
                 }
             }
         }
+        // Saved workflow actions can carry a stale, empty pdfIds/pdfId while the
+        // current email template has an active PDF selection. Use the current
+        // template PDF selection when the action contains no actual PDF ids.
+        // The review screen allows explicit per-email selection/disablement.
+        if (!self::pdf_ids_from_details($details)) {
+            $from_template = self::template_details($template);
+            if (self::pdf_ids_from_details($from_template)) {
+                $details->pdfIds = $from_template->pdfIds;
+                $details->pdfId = $from_template->pdfId;
+            }
+        }
         // MailNotifier expects a JSON string id even if a workflow carries an object.
         $details->id = wp_json_encode(['id' => (string) $template->id]);
         return $details;
+    }
+
+    /** Normalize Pro PDF template references from current template or workflow.
+     * Supports multi-PDF JSON id strings, legacy single selection, and ids stored
+     * as numbers/objects. The resender always passes Pro's expected JSON strings.
+     */
+    private static function pdf_ids_from_details(object $details): array {
+        $raw = !empty($details->pdfIds) && is_array($details->pdfIds)
+            ? $details->pdfIds : (!empty($details->pdfId) ? [$details->pdfId] : []);
+        $ids = [];
+        foreach ($raw as $entry) {
+            if (is_object($entry)) {
+                $id = absint($entry->id ?? 0);
+            } elseif (is_array($entry)) {
+                $id = absint($entry['id'] ?? 0);
+            } elseif (is_numeric($entry)) {
+                $id = absint($entry);
+            } elseif (is_string($entry)) {
+                $decoded = json_decode($entry);
+                $id = is_object($decoded) ? absint($decoded->id ?? 0) : 0;
+            } else {
+                $id = 0;
+            }
+            if ($id) { $ids[$id] = $id; }
+        }
+        return array_values($ids);
+    }
+
+    /** Only published/enabled PDF templates can be explicitly selected. */
+    private static function pdf_catalog(int $form_id): array {
+        if (!defined('BITFORMPRO_VERSION') || !class_exists('\\BitApps\\BitFormPro\\Services\\Messages\\PdfTemplateHandler')) {
+            return [];
+        }
+        try {
+            $handler = new \BitApps\BitFormPro\Services\Messages\PdfTemplateHandler($form_id);
+            $result = $handler->getAll();
+            if (!is_array($result) || is_wp_error($result)) { return []; }
+            $catalog = [];
+            foreach ($result as $row) {
+                $id = absint($row->id ?? 0);
+                if (!$id || !\BitApps\BitFormPro\Services\Messages\PdfTemplateHandler::isEnabled($row->pdf_config ?? null)) { continue; }
+                $catalog[$id] = ['id' => $id, 'title' => (string) ($row->title ?? ('PDF #' . $id))];
+            }
+            return array_values($catalog);
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    private static function apply_pdf_choice(object $details, array $ids): void {
+        // No selection means explicit choice to attach no generated PDF.
+        $details->pdfIds = array_map(static function($id) {
+            return wp_json_encode(['id' => (string) $id]);
+        }, array_values(array_unique(array_map('absint', $ids))));
+        // Pro always prefers pdfIds, but legacy pdfId could otherwise silently
+        // re-enable a disabled PDF when pdfIds is an empty array.
+        $details->pdfId = '';
     }
 
     /** Resolve currently eligible notification IDs without triggering submission side effects. */
@@ -503,19 +571,8 @@ final class BF_Email_Resender {
             'media_required' => 0, 'media_available' => 0,
             'warnings' => [], 'blocking' => [],
         ];
-        $pdf_ids = [];
-        $raw_pdf_ids = !empty($details->pdfIds) && is_array($details->pdfIds)
-            ? $details->pdfIds : (!empty($details->pdfId) ? [$details->pdfId] : []);
-        foreach ($raw_pdf_ids as $encoded) {
-            if (is_string($encoded)) {
-                $decoded = json_decode($encoded);
-                $pdf_id = is_object($decoded) ? absint($decoded->id ?? 0) : 0;
-            } else {
-                $pdf_id = is_object($encoded) ? absint($encoded->id ?? 0) : 0;
-            }
-            if ($pdf_id) { $pdf_ids[$pdf_id] = $pdf_id; }
-            else { $report['blocking'][] = 'One configured PDF template has an invalid template ID.'; }
-        }
+        $pdf_ids = self::pdf_ids_from_details($details);
+        $report['pdf_ids'] = $pdf_ids;
         $report['pdf_templates'] = count($pdf_ids);
         if ($pdf_ids) {
             if (!defined('BITFORMPRO_VERSION') || !has_filter('bitform_generate_pdf_attachment')
@@ -666,7 +723,7 @@ final class BF_Email_Resender {
                 $result[] = ['entry_id' => $id, 'error' => $e->getMessage(), 'notifications' => []];
             }
         }
-        wp_send_json_success(['entries' => $result]);
+        wp_send_json_success(['entries' => $result, 'pdf_catalog' => self::pdf_catalog($form_id)]);
     }
 
     /** Independent mail-path test: diagnoses Post SMTP separately from Bit Form templates/workflows. */
@@ -741,6 +798,30 @@ final class BF_Email_Resender {
                 wp_send_json_error(['message' => $e->getMessage()], 400);
             }
         }
+        // PDF selections are explicit per (entry, email template), never global:
+        // different emails can require different PDF templates.
+        $pdf_choices = null;
+        if (isset($_POST['pdf_choices'])) {
+            $raw_choices = wp_unslash($_POST['pdf_choices']);
+            if (!is_string($raw_choices) || strlen($raw_choices) > 16000) {
+                wp_send_json_error(['message' => 'Invalid PDF selection payload.'], 400);
+            }
+            $choices = json_decode($raw_choices, true);
+            if (!is_array($choices) || count($choices) > 150) {
+                wp_send_json_error(['message' => 'Invalid PDF selections. Review and retry.'], 400);
+            }
+            $pdf_choices = [];
+            foreach ($choices as $key => $selected) {
+                if (!is_string($key) || !preg_match('/^[1-9][0-9]*:[1-9][0-9]*$/', $key)
+                    || !is_array($selected) || count($selected) > 30) {
+                    wp_send_json_error(['message' => 'Invalid per-notification PDF selection.'], 400);
+                }
+                $pdf_choices[$key] = array_values(array_unique(array_map('absint', $selected)));
+                if (in_array(0, $pdf_choices[$key], true)) {
+                    wp_send_json_error(['message' => 'Invalid PDF template ID.'], 400);
+                }
+            }
+        }
         if (!$form_id || !$ids || count($ids) > self::MAX_BATCH) {
             wp_send_json_error(['message' => 'Choose between 1 and ' . self::MAX_BATCH . ' submissions.'], 400);
         }
@@ -750,10 +831,18 @@ final class BF_Email_Resender {
         if (!$exists) {
             wp_send_json_error(['message' => 'Form not found.'], 404);
         }
+        $pdf_allowed = array_column(self::pdf_catalog($form_id), 'id');
+        if ($pdf_choices !== null) {
+            foreach ($pdf_choices as $choice) {
+                if (array_diff($choice, $pdf_allowed)) {
+                    wp_send_json_error(['message' => 'One or more selected PDFs are not enabled or do not belong to this form.'], 400);
+                }
+            }
+        }
         $results = [];
         foreach ($ids as $id) {
             try {
-                $results[] = self::send_entry($form_id, $id, $template_id, $recipient_override);
+                $results[] = self::send_entry($form_id, $id, $template_id, $recipient_override, $pdf_choices);
             } catch (\Throwable $e) {
                 $results[] = ['entry_id' => $id, 'status' => 'error', 'message' => 'Unexpected send error: ' . $e->getMessage()];
             }
@@ -761,7 +850,7 @@ final class BF_Email_Resender {
         wp_send_json_success(['results' => $results]);
     }
 
-    private static function send_entry(int $form_id, int $entry_id, int $template_id, ?array $recipient_override): array {
+    private static function send_entry(int $form_id, int $entry_id, int $template_id, ?array $recipient_override, ?array $pdf_choices): array {
         global $wpdb;
         // Atomic lock prevents duplicate email bursts when multiple admins click at once.
         $lock = 'bfres_lock_' . $form_id . '_' . $entry_id;
@@ -811,6 +900,15 @@ final class BF_Email_Resender {
             $all_attachments = 0;
             $all_pdfs = 0;
             foreach ($found as $item) {
+                $item['details'] = clone $item['details'];
+                $choice_key = $entry_id . ':' . (int) $item['template']->id;
+                if ($pdf_choices !== null) {
+                    if (!array_key_exists($choice_key, $pdf_choices)) {
+                        $errors[] = 'PDF review for ' . $choice_key . ' is missing. Reopen Review & resend before sending.';
+                        continue;
+                    }
+                    self::apply_pdf_choice($item['details'], $pdf_choices[$choice_key]);
+                }
                 $report = self::attachment_check($item, $form_id, $entry_id, $context['values'], $context['fields']);
                 $label = $item['template']->title ?: ('Template #' . $item['template']->id);
                 if ($report['blocking']) {
@@ -832,6 +930,28 @@ final class BF_Email_Resender {
                 $captured_args = false;
                 $seen_errors = [];
                 $captured_attachments = [];
+                $pdf_generated = null;
+                $pdf_observer = static function($paths) use (&$pdf_generated) {
+                    $paths = is_array($paths) ? $paths : [$paths];
+                    $pdf_generated = count(array_filter($paths, static function($path) {
+                        return is_string($path) && is_file($path) && is_readable($path);
+                    }));
+                    return is_array($paths) ? $paths : [];
+                };
+                $missing_pdf_before_send = false;
+                $pdf_guard = static function($pre, $args) use ($report, &$missing_pdf_before_send) {
+                    if ($pre !== null || !$report['pdf_templates']) { return $pre; }
+                    $pdf_paths = (array) ($args['attachments'] ?? []);
+                    $count = 0;
+                    foreach ($pdf_paths as $path) {
+                        if (is_string($path) && strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'pdf' && is_readable($path)) { $count++; }
+                    }
+                    if ($count < $report['pdf_templates']) {
+                        $missing_pdf_before_send = true;
+                        return false; // Do not send an incomplete email containing sensitive PDF content.
+                    }
+                    return $pre;
+                };
                 $capture = static function($args) use (&$attempted, &$captured_args, &$addresses, &$captured_attachments) {
                     $captured_attachments = array_values(array_filter((array) ($args['attachments'] ?? []), 'is_string'));
                     $attempted++;
@@ -853,6 +973,8 @@ final class BF_Email_Resender {
                         $seen_errors[] = $error->get_error_message();
                     }
                 };
+                add_filter('bitform_generate_pdf_attachment', $pdf_observer, PHP_INT_MAX, 1);
+                add_filter('pre_wp_mail', $pdf_guard, -PHP_INT_MAX, 2);
                 add_filter('wp_mail', $capture, PHP_INT_MAX);
                 add_action('wp_mail_succeeded', $success, PHP_INT_MAX);
                 add_action('wp_mail_failed', $failure, PHP_INT_MAX);
@@ -875,6 +997,8 @@ final class BF_Email_Resender {
                     $seen_errors[] = $e->getMessage();
                 } finally {
                     if (null !== $route_override) { remove_filter('bitform_email_conditional_routing', $route_override, PHP_INT_MAX); }
+                    remove_filter('bitform_generate_pdf_attachment', $pdf_observer, PHP_INT_MAX);
+                    remove_filter('pre_wp_mail', $pdf_guard, -PHP_INT_MAX);
                     remove_filter('wp_mail', $capture, PHP_INT_MAX);
                     remove_action('wp_mail_succeeded', $success, PHP_INT_MAX);
                     remove_action('wp_mail_failed', $failure, PHP_INT_MAX);
@@ -892,7 +1016,16 @@ final class BF_Email_Resender {
                     $errors[] = $label . ': Email handed off without all configured PDF templates (' . $pdf_count . '/' . $report['pdf_templates'] . '). Check Bit Form Pro PDF errors before retrying.';
                 }
                 if (!$sent_in_this_call) {
-                    $errors[] = $label . ': ' . ($seen_errors ? implode('; ', $seen_errors) : ($captured_args ? 'Mail handoff not confirmed.' : 'Bit Form did not invoke wp_mail(). Check notification setup, saved entry field values and matching workflow rules.'));
+                    $pdf_details = $report['pdf_templates']
+                        ? ' Bit Form Pro generated ' . ($pdf_generated === null ? 'an unobserved number of' : $pdf_generated) . ' / ' . $report['pdf_templates'] . ' selected PDF(s).'
+                        : '';
+                    if ($missing_pdf_before_send) {
+                        $why = 'Sending blocked: selected PDF attachment(s) were not generated or not readable.';
+                    } else {
+                        $why = $seen_errors ? implode('; ', $seen_errors) : ($captured_args ? 'Mail handoff not confirmed.' : 'Bit Form did not invoke wp_mail().');
+                    }
+                    $errors[] = $label . ': ' . $why . $pdf_details
+                        . ($report['pdf_templates'] ? ' Check Bit Form Pro PDF generation and Bit Form debug/PHP logs.' : '');
                 }
             }
             $status = $accepted && !$errors ? 'accepted' : ($accepted ? 'partial' : 'error');

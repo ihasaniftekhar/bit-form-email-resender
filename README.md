@@ -1,18 +1,26 @@
-# Bit Form Email Resender — 0.3.0
+# Bit Form Email Resender — 0.4.0
 
 Independent companion plugin for **Bit Form Free 3.4.0**, with optional **Bit Form Pro 3.4.0**. Reviewed against Bit Form 3.4.0 plugin source. No modifications to the underlying Bit Form plugins. Requires WordPress 6.5+ and PHP 8.0+.
 
 ## Install / upgrade
 
 1. Back up and, where possible, test on staging first.
-2. WordPress → Plugins → Add New Plugin → Upload Plugin → `bit-form-email-resender-0.3.0.zip`.
+2. WordPress → Plugins → Add New Plugin → Upload Plugin → `bit-form-email-resender-0.4.0.zip`.
 3. When upgrading from 0.2.1, select **Replace current with uploaded**. Leave Bit Form Free, Pro, and Post SMTP installed and active.
 4. Open **Bit Form → Resend Emails**, select a form and one response, then **Review & resend**.
-5. Review the original recipient list and the **Expected assets** summary, which includes the number of configured Pro PDFs, submission attachments, media files, and saved signature images.
+5. Review the original recipient list, **select the correct PDF templates if needed**, and inspect the **Expected assets** summary, which includes the number of configured Pro PDFs, submission attachments, media files, and saved signature images.
 6. Optionally change To/CC/BCC by selecting **Replace with different recipients**. This overrides original and conditional recipients for this attempt only. The default uses current original recipients.
 7. Click **Confirm & send emails**. Check the result and Post SMTP logs.
 
-## Attachment and signature fix (0.3.0)
+## PDF resending correction (0.4.0)
+
+* The saved workflow's empty PDF configuration no longer hides selected PDFs from the current email template. This was a concrete bug in the prior companion plugin, especially after editing an email template while using existing workflows.
+* The Review screen now presents **enabled PDF templates for that form** as checkboxes for **each entry and email notification**. Selections default to the current effective settings. If your PDF is not checked, select it before resending; selections are used for that one send and do not change Bit Form settings.
+* PDF selections are checked server-side against the form's enabled PDF templates. They are normalized into Pro's expected `{"id":"..."}` format (rather than numeric IDs).
+* A pre-mail guard prevents sending a notification if one or more selected PDF files are missing, unreadable, or fail generation. The resend result reports how many PDFs Bit Form Pro generated and how many reached the WordPress mail handoff. This avoids treating a PDF-less email as successful.
+* The guard cannot fix a broken underlying Pro PDF renderer (mPDF, file permissions, PHP memory limits, etc.). If it blocks a send, check Bit Form Pro/PHP error logs. It does not guarantee that Post SMTP or the recipient retains all attachments after WordPress handoff.
+
+## Attachment and signature fixes (0.3.0)
 
 * **Workflow attachment configuration retained.** Prior versions rebuilt all notification details solely from the email template configuration. Bit Form workflows may save separate action-specific `attachment`, `mediaAttachment`, `pdfId`, and `pdfIds` values. The plugin now keeps the actual matched workflow's details and fills in only missing keys from the template configuration, mirroring the native submit flow.
 * **Array-valued fields reconstructed.** Bit Form saves arrays (such as multi-upload file lists, signature lists, and repeater data) as JSON in its entry metadata. Resending now decodes JSON values for relevant field types so the native file and signature processors receive their expected structure.
@@ -31,15 +39,15 @@ Independent companion plugin for **Bit Form Free 3.4.0**, with optional **Bit Fo
 
 ## Diagnostic notes
 
-* **No PDFs listed in Expected assets:** Open the email notification's workflow configuration in Bit Form and verify it selects the PDF template; the companion plugin uses the current workflow and template settings.
+* **No PDFs checked in Review:** Select the enabled PDF template you want attached to that specific email, then resend. Also check the email notification settings in Bit Form. Do not attach unrelated PDFs.
 * **PDF template not found / disabled:** Enable or repair the corresponding Bit Form Pro PDF template first.
 * **Missing signature upload:** The saved entry's signature file is missing or unreadable at the original Bit Form upload path. The plugin cannot reconstruct a drawn signature from its filename.
-* **Mail sent but PDF count is zero:** The underlying Pro PDF generator may have failed. Inspect Bit Form's debug logs, PHP logs, and Post SMTP's email log. Before retrying, confirm whether the earlier email was actually delivered.
+* **Selected PDF count is nonzero but Pro generation fails:** The plugin blocks email delivery instead of sending without PDFs. Inspect Bit Form Pro debug/PHP logs (PDF rendering, file permissions, memory limits). If the WordPress handoff includes PDFs but Post SMTP logs have none, investigate the transport/provider.
 * **Signature file available but not visible inline:** Check that the email/PDF template includes its signature field. Bit Form embeds email signatures using `phpmailer_init` / CID; the chosen Post SMTP mail transport must preserve inline images. A regular SMTP transport may behave differently from a direct API integration.
 * **Attachment previews are current-state checks:** Deleted files, changed templates, or conditional workflows can differ from when the entry was first submitted.
 
 ## Testing and limitations
 
-PHP lint, JavaScript syntax validation, isolated mocked workflow and file checks, and ZIP-integrity checks were performed. **A live WordPress + Bit Form Pro PDF render + Post SMTP delivery test was not available**, so test one known entry with a signature and PDF and inspect the received MIME attachments before bulk sending. WordPress reporting a successful mail handoff is not proof of inbox delivery.
+PHP lint, JavaScript syntax validation, isolated PHP PDF-configuration tests and ZIP-integrity checks were performed. **A live WordPress + Bit Form Pro PDF render + Post SMTP delivery test was not available**, so test one known entry with a signature and PDF and inspect the received MIME attachments before bulk sending. WordPress reporting a successful mail handoff is not proof of inbox delivery.
 
 The activity history stores time, form ID, entry ID, current administrator username, recipient mode, To addresses seen at handoff and attachment/PDF counts; it does not store message bodies or the private physical file paths. Removing this companion plugin does not alter Bit Form entries. The bounded history option remains in the database after removal.

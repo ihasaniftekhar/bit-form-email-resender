@@ -1,3 +1,10 @@
+## 0.4.0
+- Fix empty workflow PDF selections incorrectly overriding current email template PDFs.
+- Display each notification's selectable enabled Bit Form Pro PDF templates during resend review.
+- Validate selections against the current form and normalize PDF references for the native Pro generator.
+- Refuse to send if selected PDFs fail to reach the WordPress mail handoff; include PDF generation diagnostics.
+- Preserve original/custom To, CC, BCC; avoid duplicate integrations/payment workflows.
+
 # Changelog
 
 ## 0.3.0

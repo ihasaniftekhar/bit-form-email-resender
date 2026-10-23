@@ -22,6 +22,7 @@
   let reviewedIds = [];
   let reviewedTemplate = '0';
   let reviewable = false;
+  let pdfChoices = {};
 
   const selected = () => [...document.querySelectorAll('.bfres-check:checked')].map(x => Number(x.value));
   const setBusy = state => {
@@ -88,8 +89,10 @@
     reviewedIds = ids;
     reviewedTemplate = template.value;
     reviewable = false;
+    pdfChoices = {};
     try {
       const data = await request('bf_email_resender_preview', ids);
+      const pdfCatalog = data.pdf_catalog || [];
       summary.replaceChildren();
       let count = 0;
       let errors = 0;
@@ -117,10 +120,43 @@
             section.appendChild(sub);
             const assets = notice.attachments;
             if (assets) {
+              const key = entry.entry_id + ':' + notice.template_id;
+              const selected = (assets.pdf_ids || []).map(Number);
+              pdfChoices[key] = [...selected];
+              if (pdfCatalog.length) {
+                const group = document.createElement('fieldset');
+                group.className = 'bfres-pdf-choices';
+                const legend = document.createElement('legend');
+                legend.textContent = 'Attach Bit Form Pro PDFs to this notification';
+                group.appendChild(legend);
+                for (const item of pdfCatalog) {
+                  const row = document.createElement('label');
+                  const checkbox = document.createElement('input');
+                  checkbox.type = 'checkbox';
+                  checkbox.value = String(item.id);
+                  checkbox.checked = selected.includes(Number(item.id));
+                  checkbox.addEventListener('change', () => {
+                    const chosen = [...group.querySelectorAll('input:checked')].map(x => Number(x.value));
+                    pdfChoices[key] = chosen;
+                    const current = section.querySelector('.bfres-pdf-chosen');
+                    if (current) current.textContent = chosen.length ? chosen.length + ' PDF(s) selected for attachment.' : 'No PDFs selected. If you expect a PDF, select its template above.';
+                  const expected = section.querySelector('.bfres-asset-status .bfres-pdf-count');
+                  if (expected) expected.textContent = chosen.length + ' selected PDF(s)';
+                  });
+                  row.appendChild(checkbox);
+                  append(row, 'span', ' ' + item.title + ' (#' + item.id + ')');
+                  group.appendChild(row);
+                }
+                const chosenLine = append(group, 'p', selected.length ? selected.length + ' PDF(s) selected for attachment.' : 'No PDFs selected. If you expect a PDF, select its template above.');
+                chosenLine.className = 'bfres-pdf-chosen';
+                section.appendChild(group);
+              }
               const assetLine = document.createElement('p');
               assetLine.className = 'bfres-asset-status';
               append(assetLine, 'strong', 'Expected assets: ');
-              append(assetLine, 'span', `${assets.pdf_templates} PDF template(s); ${assets.uploads_available}/${assets.uploads_required} submission file(s); ${assets.media_available}/${assets.media_required} media file(s); ${assets.signatures_available}/${assets.signature_fields} stored signature(s) available.`);
+              const selectedLine = append(assetLine, 'span', `${selected.length} selected PDF(s)`);
+              selectedLine.className = 'bfres-pdf-count';
+              append(assetLine, 'span', `; ${assets.uploads_available}/${assets.uploads_required} submission file(s); ${assets.media_available}/${assets.media_required} media file(s); ${assets.signatures_available}/${assets.signature_fields} stored signature(s) available.`);
               section.appendChild(assetLine);
               for (const msg of (assets.blocking || [])) {
                 const line = append(section, 'p', '⚠ Cannot send with missing configured attachments: ' + msg);
@@ -175,12 +211,14 @@
       options.recipient_cc = cc.value;
       options.recipient_bcc = bcc.value;
     }
+    options.pdf_choices = JSON.stringify(pdfChoices);
+    const countSelectedPdfs = Object.values(pdfChoices).reduce((sum, ids) => sum + ids.length, 0);
     const label = template.options[template.selectedIndex]?.text || 'selected notification';
     if (template.value !== reviewedTemplate) { window.alert('Notification selection changed. Review recipients again.'); return; }
     const msg = recipientMode === 'original'
       ? 'Send to the original recipients calculated from the current Bit Form configuration?'
       : 'REPLACE original recipients with the custom To/CC/BCC addresses shown?';
-    if (!window.confirm(`Send ${label} for ${reviewedIds.length} submission(s)?\n\n${msg}\n\nThis sends real emails.`)) return;
+    if (!window.confirm(`Send ${label} for ${reviewedIds.length} submission(s)?\n\n${msg}\n\nSelected PDF attachment(s): ${countSelectedPdfs}.\nEmails with missing selected PDFs will be blocked, not sent without attachments.\n\nThis sends real emails.`)) return;
     setBusy(true);
     let complete = 0;
     let issues = 0;
