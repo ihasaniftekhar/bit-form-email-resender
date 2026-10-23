@@ -1,0 +1,14 @@
+# Local WordPress and development artifacts
+.env
+.env.*
+!.env.example
+*.log
+*.sql
+*.sqlite
+*.sqlite3
+wp-config.php
+/wp-content/
+/vendor/
+/node_modules/
+.DS_Store
+*.swp
